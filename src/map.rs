@@ -98,13 +98,6 @@ impl<K, V> Bucket<K, V> {
     /// Unsafe because it does not perform bounds checking or ensure the location was already
     /// occupied.
     #[inline(always)]
-    unsafe fn key_mut(&mut self, ind: usize) -> &mut K {
-        self.kv.as_mut().unwrap_or_else( || intrinsics::unreachable()).keys.get_unchecked_mut(ind)
-    }
-
-    /// Unsafe because it does not perform bounds checking or ensure the location was already
-    /// occupied.
-    #[inline(always)]
     unsafe fn val(&self, ind: usize) -> &V {
         self.kv.as_ref().unwrap_or_else( || intrinsics::unreachable()).vals.get_unchecked(ind)
     }
@@ -195,11 +188,6 @@ impl CacheInt {
     #[inline(always)]
     fn load_unordered(&self) -> usize {
         unsafe { intrinsics::atomic_load_unordered(self.num.get()) }
-    }
-
-    #[inline(always)]
-    fn store_relaxed(&self, val: usize) {
-        unsafe { intrinsics::atomic_store_relaxed(self.num.get(), val); }
     }
 
     #[inline(always)]
@@ -1269,7 +1257,7 @@ impl<K, V> CuckooHashMap<K, V, DefaultState<SipHasher>>
           /*K: fmt::Debug,*/
           /*V: fmt::Debug,*/
 {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Default::default()
     }
 }
@@ -1578,14 +1566,14 @@ impl BSlot {
               "pathcode may not be large enough to encode a cuckoo"
               " path");*/
 
-#[static_assert]
 /// The depth type must able to hold a value of
 /// MAX_BFS_PATH_LEN - 1");
-static MAX_BFS_PATH_FITS_IN_DEPTH: bool = (MAX_BFS_PATH_LEN - 1) as Depth <= i32::MAX;
-
 #[static_assert]
+static _MAX_BFS_PATH_FITS_IN_DEPTH: bool = (MAX_BFS_PATH_LEN - 1) as Depth <= i32::MAX;
+
 /// The depth type must be able to hold a value of -1
-static NEGATIVE_ONE_FITS_IN_DEPTH: bool = -1 as Depth >= i32::MIN;
+#[static_assert]
+static _NEGATIVE_ONE_FITS_IN_DEPTH: bool = -1 as Depth >= i32::MIN;
 
 /// b_queue is the queue used to store b_slots for BFS cuckoo hashing.
 #[repr(packed)]
@@ -1608,9 +1596,9 @@ const MAX_CUCKOO_COUNT: usize = 512;
               MAX_CUCKOO_COUNT, "MAX_CUCKOO_COUNT value is too large"
               " to be useful");*/
 
-#[static_assert]
 /// MAX_CUCKOO_COUNT should be a power of 2
-static MAX_CUCKOO_COUNT_POWER_OF_2: bool = (MAX_CUCKOO_COUNT & (MAX_CUCKOO_COUNT - 1)) == 0;
+#[static_assert]
+static _MAX_CUCKOO_COUNT_POWER_OF_2: bool = (MAX_CUCKOO_COUNT & (MAX_CUCKOO_COUNT - 1)) == 0;
 
 /// returns the index in the queue after ind, wrapping around if
 /// necessary.

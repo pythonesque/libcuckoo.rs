@@ -61,10 +61,8 @@ pub fn delete_unused<K, V>(old_pointers: &mut Vec<Box<UnsafeCell<TableInfo<K, V>
                 if intrinsics::atomic_load(hp.get()) == ptr.get() as *const TableInfo<K, V> as usize { return true }
                 list = next;
             }
-            println!("Deleting: {:p}", ptr.get());
             false
         });
-        //println!("Got here");
     }
 }
 

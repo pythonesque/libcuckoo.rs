@@ -11,7 +11,7 @@
 use core::cell::UnsafeCell;
 use core::marker;
 use core::ops::{Deref, DerefMut};
-use self::poison::{TryLockError, TryLockResult, /*LockResult*/};
+use self::poison::{/*LockResult*/};
 use super::sys::os as sys;
 
 pub mod poison {
@@ -68,17 +68,6 @@ pub mod poison {
         guard: T,
     }*/
 
-    /// An enumeration of possible errors which can occur while calling the
-    /// `try_lock` method.
-    pub enum TryLockError/*<T>*/ {
-        /// The lock could not be acquired because another thread failed while holding
-        /// the lock.
-        //Poisoned(PoisonError<T>),
-        /// The lock could not be acquired at this time because the operation would
-        /// otherwise block.
-        WouldBlock,
-    }
-
     /*/// A type alias for the result of a lock method which can be poisoned.
     ///
     /// The `Ok` variant of this result indicates that the primitive was not
@@ -87,13 +76,6 @@ pub mod poison {
     /// the associated guard, and it can be acquired through the `into_inner`
     /// method.
     pub type LockResult<Guard> = Result<Guard, PoisonError<Guard>>;*/
-
-    /// A type alias for the result of a nonblocking locking method.
-    ///
-    /// For more information, see `LockResult`. A `TryLockResult` doesn't
-    /// necessarily hold the associated guard in the `Err` type as the lock may not
-    /// have been acquired for other reasons.
-    pub type TryLockResult<Guard> = Result<Guard, TryLockError/*<Guard>*/>;
 
     /*impl<T> fmt::Debug for PoisonError<T> {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -236,39 +218,7 @@ impl StaticMutex {
         unsafe { self.lock.lock() }
         MutexGuard::new(self, &DUMMY.0)
     }
-
-    /// Attempts to grab this lock, see `Mutex::try_lock`
-    #[inline]
-    pub fn try_lock(&'static self) -> TryLockResult<MutexGuard<()>> {
-        if unsafe { self.lock.try_lock() } {
-            Ok(/*try!(*/MutexGuard::new(self, &DUMMY.0)/*)*/)
-        } else {
-            Err(TryLockError::WouldBlock)
-        }
-    }
-
-    /// Deallocates resources associated with this static mutex.
-    ///
-    /// This method is unsafe because it provides no guarantees that there are
-    /// no active users of this mutex, and safety is not guaranteed if there are
-    /// active users of this mutex.
-    ///
-    /// This method is required to ensure that there are no memory leaks on
-    /// *all* platforms. It may be the case that some platforms do not leak
-    /// memory if this method is not called, but this is not guaranteed to be
-    /// true on all platforms.
-    pub unsafe fn destroy(&'static self) {
-        self.lock.destroy()
-    }
 }
-
-pub fn guard_lock<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a sys::Mutex {
-    &guard.__lock.lock
-}
-
-/*pub fn guard_poison<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a poison::Flag {
-    &guard.__lock.poison
-}*/
 
 struct Dummy(UnsafeCell<()>);
 unsafe impl Sync for Dummy {}

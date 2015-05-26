@@ -17,7 +17,6 @@ use rand::{Rand, Rng, SeedableRng};
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-pub const NANOS_PER_SEC: u32 = 1_000_000_000;
 pub const NANOS_PER_MILLI: u32 = 1_000_000;
 pub const MILLIS_PER_SEC: u64 = 1_000;
 
@@ -27,23 +26,6 @@ pub struct Duration {
 }
 
 impl Duration {
-    /// Crates a new `Duration` from the specified number of seconds and
-    /// additional nanosecond precision.
-    ///
-    /// If the nanoseconds is greater than 1 billion (the number of nanoseconds
-    /// in a second), then it will carry over into the seconds provided.
-    #[inline]
-    pub fn new(secs: u64, nanos: u32) -> Duration {
-        let secs = secs + (nanos / NANOS_PER_SEC) as u64;
-        let nanos = nanos % NANOS_PER_SEC;
-        Duration { secs: secs, nanos: nanos }
-    }
-
-    /// Creates a new `Duration` from the specified number of seconds.
-    pub fn from_secs(secs: u64) -> Duration {
-        Duration { secs: secs, nanos: 0 }
-    }
-
     /// Creates a new `Duration` from the specified number of milliseconds.
     #[inline]
     pub fn from_millis(millis: u64) -> Duration {
