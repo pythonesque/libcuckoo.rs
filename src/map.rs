@@ -421,7 +421,10 @@ impl<K, V, S> CuckooHashMap<K, V, S>
 
     /// find searches through the table for `key`, and returns `Some(value)` if
     /// it finds the value, `None` otherwise.
-    pub fn find(&self, key: &K) -> Option<V> where K: Copy, V: Copy {
+    pub fn find(&self, key: &K) -> Option<V> where
+            K: Copy,
+            V: Copy,
+    {
         check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
@@ -468,6 +471,147 @@ impl<K, V, S> CuckooHashMap<K, V, S>
             let (ti, i1, i2) = self.snapshot_and_lock_two(hv);
             let _hpu = HazardPointerUnsetter::new();
             self.cuckoo_insert_loop(key, v, hv, ti, i1, i2)
+        }
+    }
+
+    /// erase removes `key` and it's associated value from the table, calling
+    /// their destructors. If `key` is not there, it returns false, otherwise
+    /// it returns true.
+    pub fn erase(&self, key: &K) -> Option<V> {
+        check_hazard_pointer();
+        check_counterid();
+        let hv = hashed_key(&self.hash_state, key);
+        unsafe {
+            let (ti, i1, i2) = self.snapshot_and_lock_two(hv);
+            let _hpu = HazardPointerUnsetter::new();
+
+            let result = cuckoo_delete(key, hv, ti, i1, i2);
+            unlock_two(ti, i1, i2);
+            result
+        }
+    }
+
+    /// update changes the value associated with `key` to `val`. If `key` is
+    /// not there, it returns false, otherwise it returns true.
+    pub fn update(&self, key: &K, val: V) -> Result<V, V> where
+            V: Copy,
+    {
+        check_hazard_pointer();
+        let hv = hashed_key(&self.hash_state, key);
+        unsafe {
+            let (ti, i1, i2) = self.snapshot_and_lock_two(hv);
+            let _hpu = HazardPointerUnsetter::new();
+
+            let result = cuckoo_update(key, val, hv, ti, i1, i2);
+            unlock_two(ti, i1, i2);
+            result
+        }
+    }
+
+    /// update_fn changes the value associated with `key` with the function
+    /// `updater`. `updater` will be passed one argument of type `&mut V` and can
+    /// modify the argument as desired, returning any extra information if
+    /// desired.  If `key` is not there, it returns `None`, otherwise it returns `Some(ret)` where
+    /// `ret` is the return value of `updater`.
+    pub fn update_fn<F, T>(&self, key: &K, mut updater: F) -> Option<T> where
+            F: FnMut(&mut V) -> T,
+    {
+        check_hazard_pointer();
+        let hv = hashed_key(&self.hash_state, key);
+        unsafe {
+            let (ti, i1, i2) = self.snapshot_and_lock_two(hv);
+            let _hpu = HazardPointerUnsetter::new();
+
+            let result = cuckoo_update_fn(key, &mut updater, hv, ti, i1, i2);
+            unlock_two(ti, i1, i2);
+            result
+        }
+    }
+
+    /// upsert is a combination of update_fn and insert. It first tries updating
+    /// the value associated with `key` using `updater`. If `key` is not in the
+    /// table, then it runs an insert with `key` and `val`. It will always
+    /// succeed, since if the update fails and the insert finds the key already
+    /// inserted, it can retry the update.
+    pub fn upsert<F, T>(&self, mut key: K, mut updater: F, mut val: V) -> Option<T> where
+            K: Copy + Send + Sync,
+            V: Send + Sync,
+            S: Default + Send + Sync,
+            F: FnMut(&mut V) -> T,
+    {
+        check_hazard_pointer();
+        check_counterid();
+        let hv = hashed_key(&self.hash_state, &key);
+        unsafe {
+            loop {
+                let (ti, i1, i2) = self.snapshot_and_lock_two(hv);
+                let _hpu = HazardPointerUnsetter::new();
+                match cuckoo_update_fn(&key, &mut updater, hv, ti, i1, i2) {
+                    v @ Some(_) => {
+                        unlock_two(ti, i1, i2);
+                        return v;
+                    },
+                    // We run an insert, since the update failed
+                    None => match self.cuckoo_insert_loop(key, val, hv, ti, i1, i2) {
+                        Ok(()) => return None,
+                        // The only valid reason for res being false is if insert
+                        // encountered a duplicate key after releasing the locks and
+                        // performing cuckoo hashing. In this case, we retry the entire
+                        // upsert operation.
+                        Err((_, k, v)) => {
+                            key = k;
+                            val = v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// rehash will size the table using a hashpower of `n`. Note that the
+    /// number of buckets in the table will be 2^`n` after expansion,
+    /// so the table will have 2^`n` * `SLOT_PER_BUCKET`
+    /// slots to store items in. If `n` is not larger than the current
+    /// hashpower, then the function does nothing. It returns true if the table
+    /// expansion succeeded, and false otherwise. rehash can throw an exception
+    /// if the expansion fails to allocate enough memory for the larger table.
+    pub fn rehash(&self, n: usize) -> Result<(), ()>  where
+            K: Copy + Send + Sync,
+            V: Send + Sync,
+            S: Default + Send + Sync,
+    {
+        check_hazard_pointer();
+        unsafe {
+            let ti = self.snapshot_table_nolock();
+            let _hpu = HazardPointerUnsetter::new();
+            if n <= (*ti).hashpower {
+                Err(())
+            } else {
+                self.cuckoo_expand_simple(n)
+            }
+        }
+    }
+
+    /// reserve will size the table to have enough slots for at least `n`
+    /// elements. If the table can already hold that many elements, the function
+    /// has no effect. Otherwise, the function will expand the table to a
+    /// hashpower sufficient to hold `n` elements. It will return true if there
+    /// was an expansion, and false otherwise. `reserve` can throw an exception if
+    /// the expansion fails to allocate enough memory for the larger table.
+    pub fn reserve(&self, n: usize) -> Result<(), ()> where
+            K: Copy + Send + Sync,
+            V: Send + Sync,
+            S: Default + Send + Sync,
+    {
+        check_hazard_pointer();
+        unsafe {
+            let ti = self.snapshot_table_nolock();
+            let _hpu = HazardPointerUnsetter::new();
+            if n <= hashsize((*ti).hashpower) * SLOT_PER_BUCKET {
+                Err(())
+            } else {
+                self.cuckoo_expand_simple(reserve_calc(n))
+            }
         }
     }
 
@@ -951,9 +1095,9 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     /// Unsafe because it expects the hazard pointer to be set.
     ///
     unsafe fn cuckoo_expand_simple(&self, n: usize) -> Result<(), ()> where
-        K: Copy + Send + Sync,
-        V: Send + Sync,
-        S: Default + Send + Sync,
+            K: Copy + Send + Sync,
+            V: Send + Sync,
+            S: Default + Send + Sync,
     {
         struct TI<K, V>(*mut TableInfo<K, V>);
         unsafe impl<K, V> Send for TI<K, V> where K: Send, V: Send {}
@@ -967,9 +1111,9 @@ impl<K, V, S> CuckooHashMap<K, V, S>
                                              TI(old_ti): TI<K, V>,
                                              i: usize,
                                              end: usize) where
-            K: Copy + Eq + Hash + Send + Sync,
-            V: Send + Sync,
-            S: Default + HashState + Send + Sync,
+                K: Copy + Eq + Hash + Send + Sync,
+                V: Send + Sync,
+                S: Default + HashState + Send + Sync,
         {
             let mut bucket = (*old_ti).buckets.as_mut_ptr().offset(i as isize);
             //let e = end;
@@ -1716,6 +1860,94 @@ unsafe fn try_find_insert_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
     }
     found_empty
 }
+/// try_del_from_bucket will search the bucket for the given key, and set the
+/// slot of the key to empty if it finds it.
+///
+/// This function is unsafe because it relies on ti being correctly set, the hazard pointer being
+/// set, the correct locks having been taken, and the index being in bounds.
+unsafe fn try_del_from_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
+                                       key: &K,
+                                       i: usize)
+                                       -> Option<V>
+    where K: Eq,
+{
+    // Safe because we have the lock.
+    let bucket = (*ti).buckets.get_unchecked_mut(i);
+    for j in Range::new(0, SLOT_PER_BUCKET) {
+        if !bucket.occupied(j) {
+            continue;
+        }
+        // For now, we know we are "simple" so we skip this part.
+        // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
+        //     continue;
+        // }
+        if bucket.key(j) == key {
+            let (_, v) = bucket.erase_kv(j);
+            let counterid = (*COUNTER_ID.0.get()).unwrap_or_else( || intrinsics::unreachable() );
+            let num_deletes = (*ti).num_deletes.get_unchecked(counterid);
+            num_deletes.fetch_add_relaxed(1);
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// try_update_bucket will search the bucket for the given key and change its
+/// associated value if it finds it.
+///
+/// This function is unsafe because it relies on ti being correctly set, the hazard pointer being
+/// set, the correct locks having been taken, and the index being in bounds.
+unsafe fn try_update_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
+                                     key: &K, value: V, i: usize)
+                                     -> Result<V, V> where
+        K: Eq,
+        V: Copy,
+{
+    // Safe because we have the lock.
+    let bucket = (*ti).buckets.get_unchecked_mut(i);
+    for j in Range::new(0, SLOT_PER_BUCKET) {
+        if !bucket.occupied(j) {
+            continue;
+        }
+        // For now, we know we are "simple" so we skip this part.
+        // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
+        //     continue;
+        // }
+        if bucket.key(j) == key {
+            return Ok(mem::replace(bucket.val_mut(j), value))
+        }
+    }
+    Err(value)
+}
+
+/// try_update_bucket_fn will search the bucket for the given key and change
+/// its associated value with the given function if it finds it.
+///
+/// This function is unsafe because it relies on ti being correctly set, the hazard pointer being
+/// set, the correct locks having been taken, and the index being in bounds.
+unsafe fn try_update_bucket_fn<K, V, P, F, T>(ti: *mut TableInfo<K, V>, _partial: P,
+                                              key: &K, updater: &mut F, i: usize)
+                                              -> Option<T> where
+        K: Eq,
+        F: FnMut(&mut V) -> T,
+{
+    // Safe because we have the lock.
+    let bucket = (*ti).buckets.get_unchecked_mut(i);
+    for j in Range::new(0, SLOT_PER_BUCKET) {
+        if !bucket.occupied(j) {
+            continue;
+        }
+        // For now, we know we are "simple" so we skip this part.
+        // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
+        //     continue;
+        // }
+        if bucket.key(j) == key {
+            let res = updater(bucket.val_mut(j));
+            return Some(res);
+        }
+    }
+    None
+}
 
 /// cuckoo_find searches the table for the given key and value, storing the
 /// value in the val if it finds the key. It expects the locks to be taken
@@ -1725,8 +1957,9 @@ unsafe fn try_find_insert_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
 /// set, and i1 and i2 to be in bounds.
 unsafe fn cuckoo_find<K, V>(key: &K,
                             _hv: usize, ti: *mut TableInfo<K, V>,
-                            i1: usize, i2: usize) -> Option<V>
-    where K: Copy + Eq, V: Copy,
+                            i1: usize, i2: usize) -> Option<V> where
+        K: Copy + Eq,
+        V: Copy,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
@@ -1749,6 +1982,66 @@ unsafe fn cuckoo_contains<K, V>(key: &K,
     let partial = ();
     check_in_bucket(ti, partial, key, i1)
         || check_in_bucket(ti, partial, key, i2)
+}
+
+/// cuckoo_delete searches the table for the given key and sets the slot with
+/// that key to empty if it finds it. It expects the locks to be taken and
+/// released outside the function.
+///
+/// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be set,
+/// and i1 and i2 to be in bounds.
+unsafe fn cuckoo_delete<K, V>(key: &K,
+                              _hv: usize, ti: *mut TableInfo<K, V>,
+                              i1: usize, i2: usize) -> Option<V>
+    where K: Eq,
+{
+    //const partial_t partial = partial_key(hv);
+    let partial = ();
+    match try_del_from_bucket(ti, partial, key, i1) {
+        v @ Some(_) => v,
+        None => try_del_from_bucket(ti, partial, key, i2)
+    }
+}
+
+/// cuckoo_update searches the table for the given key and updates its value
+/// if it finds it. It expects the locks to be taken and released outside the
+/// function.
+///
+/// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be set,
+/// and i1 and i2 to be in bounds.
+unsafe fn cuckoo_update<K,V>(key: &K, val: V,
+                             _hv: usize, ti: *mut TableInfo<K, V>,
+                             i1: usize, i2: usize) -> Result<V, V> where
+        K: Eq,
+        V: Copy,
+{
+    //const partial_t partial = partial_key(hv);
+    let partial = ();
+    match try_update_bucket(ti, partial, key, val, i1) {
+        v @ Ok(_) => v,
+        Err(val) => try_update_bucket(ti, partial, key, val, i2)
+    }
+}
+
+/// cuckoo_update_fn searches the table for the given key and runs the given
+/// function on its value if it finds it, assigning the result of the
+/// function to the value. It expects the locks to be taken and released
+/// outside the function.
+///
+/// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be set,
+/// and i1 and i2 to be in bounds.
+unsafe fn cuckoo_update_fn<K, V, F, T>(key: &K, updater: &mut F,
+                                       _hv: usize, ti: *mut TableInfo<K, V>,
+                                       i1: usize, i2: usize) -> Option<T> where
+        K: Eq,
+        F: FnMut(&mut V) -> T,
+{
+    //const partial_t partial = partial_key(hv);
+    let partial = ();
+    match try_update_bucket_fn(ti, partial, key, updater, i1) {
+        v @ Some(_) => v,
+        None => try_update_bucket_fn(ti, partial, key, updater, i2)
+    }
 }
 
 /// cuckoo_size returns the number of elements in the given table.

@@ -102,23 +102,64 @@ fn main() {
 //#[no_mangle] // ensure that this symbol is called `main` in the output
 //pub extern fn main(argc: i32, argv: *const *const u8) -> i32 {
     //let map = CuckooHashMap::<(), (), DefaultState<FnvHasher>>::default();
-    let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::default();
+    //let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::default();
+    let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::with_capacity_and_hash_state(1 << 24, Default::default());
     type Key = u64;
     //const MAX: Key = 0x20add; // no cuckoo (133853)
     //const MAX: Key = 0x3df36; // no resize (253750) 4 * 4 * 4 * 253750
-    const MAX: Key = 10_000_000; // no resize
+    const MAX: Key = 650_000;
+    //const MAX: Key = 1_000_000;
     //const MAX: Key = 20 * 3000;
     const CORES: Key = 4;
-    const SLICE_THREADS: Key = 1; //CORES;
+    const SLICE_THREADS: Key = CORES;//1;//CORES; // 1
     const NUM_THREADS: Key = 4;
-    const LOAD_FACTOR: Key = 6;
+    const LOAD_FACTOR: Key = 1;//6;
     const NUM_READS: Key = LOAD_FACTOR * ((CORES + NUM_THREADS - 1) / NUM_THREADS) * ((CORES + NUM_THREADS - 1) / NUM_THREADS)* SLICE_THREADS;// * 4;//60; // 48 * 4 * 4 * 20 * 3000
     println!("threads: {}, reads: {}, writes: {}", NUM_THREADS, NUM_READS * NUM_THREADS * NUM_THREADS / SLICE_THREADS * MAX, MAX);
 
-    let insert = |j| {
+    let upsert = |j: Key| {
+        let range = /*if SLICE_THREADS == CORES {
+            Range::new(th, th + 1)
+        } else {
+            */Range::new(0, NUM_THREADS)/*
+        }*/;
+        //let mut upserts = 0;
+        /*'here: */for j in range {
+            for i in Range::new(j * MAX, (j + 1) * MAX) {
+                if let None = map.upsert(i, |b| { *b = true; }, false) {
+                    continue;
+                }
+                if map.find(&i) != Some(true) {
+                    //println!("upsert error");
+                    unsafe { intrinsics::abort(); }
+                    //break 'here;
+                }
+                //upserts += 1;
+            }
+        }
+        println!("({}) upserts", j);//, upserts);
+    };
+    let delete = |j: Key| {
+        //let mut deletes = 0;
+        for i in Range::new(j * MAX, (j + 1) * MAX) {
+            if let None = map.erase(&i) {
+                //println!("delete error");
+                unsafe { intrinsics::abort(); }
+                //break;
+            }
+            if let Some(_) = map.find(&i) {
+                //println!("find after delete error");
+                unsafe { intrinsics::abort(); }
+                //break;
+            }
+            //deletes += 1;
+        }
+        println!("({}) deletes", j);//, writes);
+    };
+    let insert = |j: Key| {
         //let mut writes = 0;
         for i in Range::new(j * MAX, (j + 1) * MAX) {
-            if let Err(_) = map.insert(i, /*[0u8; 1024]*/()) {
+            if let Err(_) = map.insert(i, /*[0u8; 1024]*/false) {
                 //println!("insert error");
                 unsafe { intrinsics::abort(); }
                 //break;
@@ -127,7 +168,19 @@ fn main() {
         }
         println!("({}) writes", j);//, writes);
     };
-    let find = |th| {
+    let update = |j: Key| {
+        //let mut update = 0;
+        for i in Range::new(j * MAX, (j + 1) * MAX) {
+            if map.update(&i, /*[0u8; 1024]*/true) != Ok(false) {
+                //println!("update error");
+                unsafe { intrinsics::abort(); }
+                //break;
+            }
+            //updates += 1;
+        }
+        println!("({}) updates", j);//, updates);
+    };
+    let find = |th: Key| {
         let range = if SLICE_THREADS == CORES {
             Range::new(th, th + 1)
         } else {
@@ -137,7 +190,7 @@ fn main() {
         /*'here: */for j in range {
             for _ in Range::new(0, NUM_READS) {
                 for i in Range::new(j * MAX, (j + 1) * MAX) {
-                    if let None = map.find(&i) {
+                    if map.find(&i) != Some(true) {
                         //println!("find error");
                         unsafe { intrinsics::abort(); }
                         //break 'here;
@@ -157,13 +210,38 @@ fn main() {
         t
     }
     unsafe {
-        make_threads(&insert);
-    }
-    unsafe {
-        make_threads(&find);
+        {
+            make_threads(&upsert);
+        }
+        if SLICE_THREADS == CORES {
+            let all = |th| {
+                delete(th);
+                insert(th);
+                update(th);
+                find(th);
+            };
+            make_threads(&all);
+        } else {
+            {
+                make_threads(&insert);
+            }
+            {
+                make_threads(&update);
+            }
+            {
+                make_threads(&find);
+            }
+            {
+                make_threads(&delete);
+            }
+        }
     }
 
-    /*insert(0);
+    /*
+    upsert(0);
+    delete(0);
+    insert(0);
+    update(0);
     find(0);*/
     /*//extern crate libc;
     //extern crate time;
