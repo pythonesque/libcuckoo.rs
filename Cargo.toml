@@ -1,0 +1,13 @@
+[package]
+name = "libcukoo"
+version = "0.1.0"
+authors = ["Joshua Yanovski <pythonesque@gmail.com>"]
+
+[dependencies]
+num_cpus = "0.2.5"
+rand = "0.3"
+# mach = "0.0.2"
+
+# [dependencies.clock_ticks]
+# version = "0.0.5"
+# path = "/Users/pythonesque/.cargo/git/checkouts/clock_ticks-9428292a9c637b8e/master"
