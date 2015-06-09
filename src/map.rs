@@ -1107,12 +1107,12 @@ impl<K, V, S> CuckooHashMap<K, V, S>
             //let e = end;
             //println!("Inserting {}..{}", i, e);
             let end = (*old_ti).buckets.as_mut_ptr().offset(end as isize);
-            let mut x = 0;
+            //let mut x = 0;
             while bucket != end {
-                x = x + 1;
+                /*x = x + 1;
                 if x % 100000 == 0 {
                     //println!("x: {} ({}..{})", x + i, i, e);
-                }
+                }*/
                 let kv = (*bucket).kv.as_mut().unwrap_or_else( || intrinsics::unreachable());
                 let mut keys = kv.keys.as_mut_ptr();
                 let mut vals = kv.vals.as_mut_ptr();
