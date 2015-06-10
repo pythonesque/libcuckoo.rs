@@ -351,9 +351,8 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     /// destructors.
     pub fn clear(&self) {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         unsafe {
-            let ti = self.snapshot_and_lock_all(hazard_pointer);
+            let ti = self.snapshot_and_lock_all(&hazard_pointer);
             //debug_assert!(ti == self.table_info.load(Ordering::SeqCst));
             let _au = AllUnlocker::new(ti);
             // cuckoo_clear empties the table, calling the destructors of all the
@@ -377,9 +376,8 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     /// so the result may not necessarily be exact (it may even be negative).
     pub fn size(&self) -> isize {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         unsafe {
-            let ti = self.snapshot_table_nolock(hazard_pointer);
+            let ti = self.snapshot_table_nolock(&hazard_pointer);
             cuckoo_size(ti)
         }
     }
@@ -393,9 +391,8 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     /// log_2(the number of buckets).
     pub fn hashpower(&self) -> usize {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         unsafe {
-            let ti = self.snapshot_table_nolock(hazard_pointer);
+            let ti = self.snapshot_table_nolock(&hazard_pointer);
             (*ti).hashpower
         }
     }
@@ -404,9 +401,8 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     pub fn bucket_count(&self) -> usize {
         /*
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         unsafe {
-            let ti = self.snapshot_table_nolock();
+            let ti = self.snapshot_table_nolock(&hazard_pointer);
             hashsize((&*ti).hashpower)
         }*/
         hashsize(self.hashpower())
@@ -417,9 +413,8 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     /// The result may not necessarily be exact (it may even be negative).
     pub fn load_factor(&self) -> f64 {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         unsafe {
-            let ti = self.snapshot_table_nolock(hazard_pointer);
+            let ti = self.snapshot_table_nolock(&hazard_pointer);
             cuckoo_loadfactor(ti)
         }
     }
@@ -431,10 +426,9 @@ impl<K, V, S> CuckooHashMap<K, V, S>
             V: Copy,
     {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(hazard_pointer, hv);
+            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
             let st = cuckoo_find(key, hv, ti, i1, i2);
             unlock_two(ti, i1, i2);
@@ -447,10 +441,9 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     pub fn contains(&self, key: &K) -> bool where K: Copy,
     {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(hazard_pointer, hv);
+            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
             let result = cuckoo_contains(key, hv, ti, i1, i2);
             unlock_two(ti, i1, i2);
@@ -470,12 +463,11 @@ impl<K, V, S> CuckooHashMap<K, V, S>
           S: Default + Send + Sync,
     {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         check_counterid();
         let hv = hashed_key(&self.hash_state, &key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(hazard_pointer, hv);
-            self.cuckoo_insert_loop(hazard_pointer, key, v, hv, ti, i1, i2)
+            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            self.cuckoo_insert_loop(&hazard_pointer, key, v, hv, ti, i1, i2)
         }
     }
 
@@ -484,11 +476,10 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     /// it returns true.
     pub fn erase(&self, key: &K) -> Option<V> {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         check_counterid();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(hazard_pointer, hv);
+            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
             let result = cuckoo_delete(key, hv, ti, i1, i2);
             unlock_two(ti, i1, i2);
@@ -502,10 +493,9 @@ impl<K, V, S> CuckooHashMap<K, V, S>
             V: Copy,
     {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(hazard_pointer, hv);
+            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
             let result = cuckoo_update(key, val, hv, ti, i1, i2);
             unlock_two(ti, i1, i2);
@@ -522,10 +512,9 @@ impl<K, V, S> CuckooHashMap<K, V, S>
             F: FnMut(&mut V) -> T,
     {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(hazard_pointer, hv);
+            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
             let result = cuckoo_update_fn(key, &mut updater, hv, ti, i1, i2);
             unlock_two(ti, i1, i2);
@@ -545,19 +534,18 @@ impl<K, V, S> CuckooHashMap<K, V, S>
             F: FnMut(&mut V) -> T,
     {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         check_counterid();
         let hv = hashed_key(&self.hash_state, &key);
         unsafe {
             loop {
-                let (ti, i1, i2) = self.snapshot_and_lock_two(hazard_pointer, hv);
+                let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
                 match cuckoo_update_fn(&key, &mut updater, hv, ti, i1, i2) {
                     v @ Some(_) => {
                         unlock_two(ti, i1, i2);
                         return v;
                     },
                     // We run an insert, since the update failed
-                    None => match self.cuckoo_insert_loop(hazard_pointer, key, val, hv, ti, i1, i2) {
+                    None => match self.cuckoo_insert_loop(&hazard_pointer, key, val, hv, ti, i1, i2) {
                         Ok(()) => return None,
                         // The only valid reason for res being false is if insert
                         // encountered a duplicate key after releasing the locks and
@@ -586,13 +574,12 @@ impl<K, V, S> CuckooHashMap<K, V, S>
             S: Default + Send + Sync,
     {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         unsafe {
-            let ti = self.snapshot_table_nolock(hazard_pointer);
+            let ti = self.snapshot_table_nolock(&hazard_pointer);
             if n <= (*ti).hashpower {
                 Err(())
             } else {
-                self.cuckoo_expand_simple(hazard_pointer, n)
+                self.cuckoo_expand_simple(&hazard_pointer, n)
             }
         }
     }
@@ -609,13 +596,12 @@ impl<K, V, S> CuckooHashMap<K, V, S>
             S: Default + Send + Sync,
     {
         let hazard_pointer = check_hazard_pointer();
-        let hazard_pointer = &*hazard_pointer;
         unsafe {
-            let ti = self.snapshot_table_nolock(hazard_pointer);
+            let ti = self.snapshot_table_nolock(&hazard_pointer);
             if n <= hashsize((*ti).hashpower).wrapping_mul(SLOT_PER_BUCKET) {
                 Err(())
             } else {
-                self.cuckoo_expand_simple(hazard_pointer, reserve_calc(n))
+                self.cuckoo_expand_simple(&hazard_pointer, reserve_calc(n))
             }
         }
     }
