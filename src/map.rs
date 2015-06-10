@@ -458,7 +458,7 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     /// which insert will propagate. If `key` is already in the table, it
     /// returns false, otherwise it returns true.
     pub fn insert(&self, key: K, v: V) -> InsertResult<(), K, V>
-    where K: Copy + Eq + Hash + Send + Sync,
+    where K: Copy + Send + Sync,
           V: Send + Sync,
           S: Default + Send + Sync,
     {
