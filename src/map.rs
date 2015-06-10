@@ -239,7 +239,9 @@ impl<K, V> TableInfo<K, V> {
         K: fmt::Debug,
         V: fmt::Debug,*/
     {
-        fn from_fn<F, T>(n: usize, f: F) -> Vec<T> where F: Fn() -> T {
+        fn from_fn<F, T>(n: usize, f: F) -> Vec<T> where
+                F: Fn() -> T,
+        {
             if mem::size_of::<T>() != 0 && n.checked_mul(mem::size_of::<T>()).is_none() {
                 //println!("capacity error: new TableInfo");
                 unsafe { intrinsics::abort(); }
@@ -327,11 +329,11 @@ pub struct CuckooHashMap<K, V, S = DefaultState<SipHasher>> {
     hash_state: S,
 }
 
-impl<K, V, S> CuckooHashMap<K, V, S>
-    where K: Eq + Hash,
-          /*K: fmt::Debug,*/
-          /*V: fmt::Debug,*/
-          S: HashState,
+impl<K, V, S> CuckooHashMap<K, V, S> where
+        K: Eq + Hash,
+        /*K: fmt::Debug,*/
+        /*V: fmt::Debug,*/
+        S: HashState,
 {
     /// cuckoo_init initializes the hashtable, given an initial hashpower as the
     /// argument.
@@ -438,7 +440,8 @@ impl<K, V, S> CuckooHashMap<K, V, S>
 
     /// contains searches through the table for `key`, and returns true if it
     /// finds it in the table, and false otherwise.
-    pub fn contains(&self, key: &K) -> bool where K: Copy,
+    pub fn contains(&self, key: &K) -> bool where
+            K: Copy,
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
@@ -457,10 +460,10 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     /// expand until it can succeed. Note that expansion can throw an exception,
     /// which insert will propagate. If `key` is already in the table, it
     /// returns false, otherwise it returns true.
-    pub fn insert(&self, key: K, v: V) -> InsertResult<(), K, V>
-    where K: Copy + Send + Sync,
-          V: Send + Sync,
-          S: Default + Send + Sync,
+    pub fn insert(&self, key: K, v: V) -> InsertResult<(), K, V> where
+            K: Copy + Send + Sync,
+            V: Send + Sync,
+            S: Default + Send + Sync,
     {
         let hazard_pointer = check_hazard_pointer();
         check_counterid();
@@ -971,8 +974,8 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     unsafe fn cuckoo_insert(&self,
                             key: K, val: V,
                             hv: usize, ti: *mut TableInfo<K, V>,
-                            i1: usize, i2: usize) -> InsertResult<(), K, V>
-        where K: Copy + Eq,
+                            i1: usize, i2: usize) -> InsertResult<(), K, V> where
+            K: Copy + Eq,
     {
         //const partial_t partial = partial_key(hv);
         let partial = ();
@@ -1251,21 +1254,21 @@ unsafe impl<K, V, S> Sync for CuckooHashMap<K,V, S> where
     S: Send + Sync {}
 
 
-impl<K, V, S> Default for CuckooHashMap<K, V, S>
-    where K: Eq + Hash,
-          /*K: fmt::Debug,*/
-          /*V: fmt::Debug,*/
-          S: HashState + Default
+impl<K, V, S> Default for CuckooHashMap<K, V, S> where
+        K: Eq + Hash,
+        /*K: fmt::Debug,*/
+        /*V: fmt::Debug,*/
+        S: HashState + Default
 {
     fn default() -> Self {
         Self::with_capacity_and_hash_state(DEFAULT_SIZE, Default::default())
     }
 }
 
-impl<K, V> CuckooHashMap<K, V, DefaultState<SipHasher>>
-    where K: Eq + Hash,
-          /*K: fmt::Debug,*/
-          /*V: fmt::Debug,*/
+impl<K, V> CuckooHashMap<K, V, DefaultState<SipHasher>> where
+        K: Eq + Hash,
+        /*K: fmt::Debug,*/
+        /*V: fmt::Debug,*/
 {
     fn new() -> Self {
         Default::default()
@@ -1492,9 +1495,9 @@ fn hashmask(hashpower: usize) -> usize {
 
 /// hashed_key hashes the given key.
 #[inline(always)]
-fn hashed_key<K: ?Sized, S>(hash_state: &S, key: &K) -> usize
-    where K: Hash,
-          S: HashState,
+fn hashed_key<K: ?Sized, S>(hash_state: &S, key: &K) -> usize where
+        K: Hash,
+        S: HashState,
 {
     let mut state = hash_state.hasher();
     key.hash(&mut state);
@@ -1618,7 +1621,9 @@ fn increment(ind: usize) -> usize {
 
 impl BQueue{
     #[inline(always)]
-    fn new() -> Self where BSlot: Copy {
+    fn new() -> Self where
+            BSlot: Copy,
+    {
         BQueue {
             // Perfectly safe because `BSlot` is `Copy`.
             slots: unsafe { mem::uninitialized() },
@@ -1754,9 +1759,9 @@ unsafe fn cuckoopath_move<K, V>(ti: *mut TableInfo<K, V>,
 /// bounds.
 unsafe fn try_read_from_bucket<K, V, P>
                               (ti: *const TableInfo<K, V>, _partial: P,
-                               key: &K, i: usize) -> Option<V>
-    where K: Copy + Eq,
-          V: Copy,
+                               key: &K, i: usize) -> Option<V> where
+        K: Copy + Eq,
+        V: Copy,
 {
     let bucket = (*ti).buckets.get_unchecked(i);
     for j in Range::new(0, SLOT_PER_BUCKET) {
@@ -1781,8 +1786,8 @@ unsafe fn try_read_from_bucket<K, V, P>
 /// bounds.
 unsafe fn check_in_bucket<K, V, P>
                          (ti: *const TableInfo<K, V>, _partial: P,
-                          key: &K, i: usize) -> bool
-    where K: Copy + Eq,
+                          key: &K, i: usize) -> bool where
+        K: Copy + Eq,
 {
     let bucket = (*ti).buckets.get_unchecked(i);
     for j in Range::new(0, SLOT_PER_BUCKET) {
@@ -1808,10 +1813,10 @@ unsafe fn check_in_bucket<K, V, P>
 /// checking]).
 unsafe fn add_to_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
                                  key: K, val: V,
-                                 i: usize, j: usize)
-    where K: Copy + Eq,
-          /*K: fmt::Debug,*/
-          /*V: fmt::Debug,*/
+                                 i: usize, j: usize) where
+        K: Copy + Eq,
+        /*K: fmt::Debug,*/
+        /*V: fmt::Debug,*/
 {
     let bucket = (*ti).buckets.get_unchecked_mut(i);
     //debug_assert!(!bucket.occupied(j));
@@ -1836,8 +1841,8 @@ unsafe fn add_to_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
 unsafe fn try_find_insert_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
                                           key: &K,
                                           i: usize)
-                                          -> Result<usize, InsertError>
-    where K: Copy + Eq,
+                                          -> Result<usize, InsertError> where
+        K: Copy + Eq,
 {
     let mut found_empty = Err(TableFull);
     let bucket = (*ti).buckets.get_unchecked(i);
@@ -1866,8 +1871,8 @@ unsafe fn try_find_insert_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
 unsafe fn try_del_from_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
                                        key: &K,
                                        i: usize)
-                                       -> Option<V>
-    where K: Eq,
+                                       -> Option<V> where
+        K: Eq,
 {
     // Safe because we have the lock.
     let bucket = (*ti).buckets.get_unchecked_mut(i);
@@ -1990,8 +1995,8 @@ unsafe fn cuckoo_contains<K, V>(key: &K,
 /// and i1 and i2 to be in bounds.
 unsafe fn cuckoo_delete<K, V>(key: &K,
                               _hv: usize, ti: *mut TableInfo<K, V>,
-                              i1: usize, i2: usize) -> Option<V>
-    where K: Eq,
+                              i1: usize, i2: usize) -> Option<V> where
+        K: Eq,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
