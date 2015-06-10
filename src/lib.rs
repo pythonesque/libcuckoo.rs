@@ -1,5 +1,6 @@
 //#![no_start]
 #![feature(asm,associated_consts,box_syntax,lang_items,libc,start,std_misc,thread_local,no_std,core,unsafe_no_drop_flag,static_assert,/*rustc_private,*/zero_one,step_trait,optin_builtin_traits,scoped,simd)]
+#![feature(const_fn)]
 #![cfg_attr(test, feature(test))]
 #![allow(dead_code)]
 //#![no_std]
