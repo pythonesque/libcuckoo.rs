@@ -1038,8 +1038,7 @@ impl<K, V, S> CuckooHashMap<K, V, S>
 
     /// We run cuckoo_insert in a loop until it succeeds in insert and upsert, so
     /// we pulled out the loop to avoid duplicating it. This should be called
-    /// directly after snapshot_and_lock_two, and by the end of the function, the
-    /// hazard pointer will have been unset.
+    /// directly after snapshot_and_lock_two.
     ///
     /// Unsafe because it expects the locks to be taken, ti to be appropriately set,
     /// and i1 and i2 to be in bounds.
@@ -1087,9 +1086,7 @@ impl<K, V, S> CuckooHashMap<K, V, S>
     /// the table during expansion. If some other thread is holding the expansion
     /// thread at the time, then it will return failure_under_expansion.
     /// n should be a valid size (as per `reserve_calc`).
-    /// Unsafe because it expects the hazard pointer to be set.
-    ///
-    unsafe fn cuckoo_expand_simple(&self, hazard_pointer: &HazardPointer,
+    fn cuckoo_expand_simple(&self, hazard_pointer: &HazardPointer,
                                    n: usize) -> Result<(), ()> where
             K: Copy + Send + Sync,
             V: Send + Sync,
@@ -1142,92 +1139,94 @@ impl<K, V, S> CuckooHashMap<K, V, S>
             //println!("Done inserting {}..{}", i, e);
         }
 
-        //println!("expand");
-        let ti = self.snapshot_and_lock_all(hazard_pointer);
-        //println!("locked");
-        //debug_assert!(ti == self.table_info.load(Ordering::SeqCst));
-        let _au = AllUnlocker::new(ti);
-        //TODO: Evaluate whether we actually do need this for some reason.  I don't really
-        //understand why we would.
-        //let _hpu = HazardPointerUnsetter::new(hazard_pointer);
-        if n <= (*ti).hashpower {
-            // Most likely another expansion ran before this one could grab the
-            // locks
-            return Err(());
-        }
+        unsafe {
+            //println!("expand");
+            let ti = self.snapshot_and_lock_all(hazard_pointer);
+            //println!("locked");
+            //debug_assert!(ti == self.table_info.load(Ordering::SeqCst));
+            let _au = AllUnlocker::new(ti);
+            //TODO: Evaluate whether we actually do need this for some reason.  I don't really
+            //understand why we would.
+            //let _hpu = HazardPointerUnsetter::new(hazard_pointer);
+            if n <= (*ti).hashpower {
+                // Most likely another expansion ran before this one could grab the
+                // locks
+                return Err(());
+            }
 
-        // Creates a new hash table with hashpower n and adds all the
-        // elements from the old buckets
+            // Creates a new hash table with hashpower n and adds all the
+            // elements from the old buckets
 
-        let ref new_map = Self::with_capacity_and_hash_state(
-            hashsize(n).wrapping_mul(SLOT_PER_BUCKET),
-            Default::default());
-        //let threadnum = num_cpus::get();
-        let threadnum = (*ti).num_inserts.len();
-        if threadnum == 0 {
-            // Pretty sure this should actually be impossible.
-            // TODO: refactor this after I make sure.
-            //println!("Shouldn't be possible for thread num to equal zero.");
-            intrinsics::abort();
-        }
-        let buckets_per_thread =
-            intrinsics::unchecked_udiv(hashsize((*ti).hashpower), threadnum);
+            let ref new_map = Self::with_capacity_and_hash_state(
+                hashsize(n).wrapping_mul(SLOT_PER_BUCKET),
+                Default::default());
+            //let threadnum = num_cpus::get();
+            let threadnum = (*ti).num_inserts.len();
+            if threadnum == 0 {
+                // Pretty sure this should actually be impossible.
+                // TODO: refactor this after I make sure.
+                //println!("Shouldn't be possible for thread num to equal zero.");
+                intrinsics::abort();
+            }
+            let buckets_per_thread =
+                intrinsics::unchecked_udiv(hashsize((*ti).hashpower), threadnum);
 
-        if mem::size_of::<thread::JoinGuard<()>>() != 0 &&
-           threadnum.checked_mul(mem::size_of::<thread::JoinGuard<()>>()).is_none() {
-            //println!("Overflow calculating join guard vector length");
-            intrinsics::abort();
-        }
-        {
-            //println!("computing");
-            let hashsize = hashsize((*ti).hashpower);
-            let mut vec = Vec::with_capacity(threadnum);
-            let mut ptr = vec.as_mut_ptr();
-            let mut i = 0;
-            while i < threadnum.wrapping_sub(1) {
-                let ti = TI(ti);
-                let t = thread::scoped( move || {
-                    insert_into_table(new_map, ti,
-                                      i.wrapping_mul(buckets_per_thread),
-                                      i.wrapping_add(1).wrapping_mul(buckets_per_thread));
-                });
-                ptr::write(ptr, t);
-                i += 1;
-                vec.set_len(i);
-                ptr = ptr.offset(1);
+            if mem::size_of::<thread::JoinGuard<()>>() != 0 &&
+               threadnum.checked_mul(mem::size_of::<thread::JoinGuard<()>>()).is_none() {
+                //println!("Overflow calculating join guard vector length");
+                intrinsics::abort();
             }
             {
-                let ti = TI(ti);
-                let t = thread::scoped( move || {
-                    insert_into_table(new_map, ti,
-                                      i.wrapping_mul(buckets_per_thread),
-                                      hashsize);
-                });
-                ptr::write(ptr, t);
-                vec.set_len(threadnum);
+                //println!("computing");
+                let hashsize = hashsize((*ti).hashpower);
+                let mut vec = Vec::with_capacity(threadnum);
+                let mut ptr = vec.as_mut_ptr();
+                let mut i = 0;
+                while i < threadnum.wrapping_sub(1) {
+                    let ti = TI(ti);
+                    let t = thread::scoped( move || {
+                        insert_into_table(new_map, ti,
+                                          i.wrapping_mul(buckets_per_thread),
+                                          i.wrapping_add(1).wrapping_mul(buckets_per_thread));
+                    });
+                    ptr::write(ptr, t);
+                    i += 1;
+                    vec.set_len(i);
+                    ptr = ptr.offset(1);
+                }
+                {
+                    let ti = TI(ti);
+                    let t = thread::scoped( move || {
+                        insert_into_table(new_map, ti,
+                                          i.wrapping_mul(buckets_per_thread),
+                                          hashsize);
+                    });
+                    ptr::write(ptr, t);
+                    vec.set_len(threadnum);
+                }
             }
-        }
-        //println!("done computing");
-        // Sets this table_info to new_map's. It then sets new_map's
-        // table_info to nullptr, so that it doesn't get deleted when
-        // new_map goes out of scope
-        // NOTE: Relaxed load is likely sufficient here because we are the only thread that
-        // could possibly have access to it at the moment (the other threads that knew about it are
-        // joined now, and the join formed a synchronization point).  Keep it SeqCst anyway unless
-        // it proves to be a bottleneck (note that there is one other possible way for them to be
-        // written to--via deleted_unused--but it shouldn't be possible for that to run with a
-        // pointer with the same address as the old one at the same time.
-        //
-        // Not sure about the store... again, keeping it SeqCst for now.
-        self.table_info.store(new_map.table_info.load(Ordering::SeqCst), Ordering::SeqCst);
-        new_map.table_info.store(ptr::null_mut(), Ordering::SeqCst);
+            //println!("done computing");
+            // Sets this table_info to new_map's. It then sets new_map's
+            // table_info to nullptr, so that it doesn't get deleted when
+            // new_map goes out of scope
+            // NOTE: Relaxed load is likely sufficient here because we are the only thread that
+            // could possibly have access to it at the moment (the other threads that knew about it are
+            // joined now, and the join formed a synchronization point).  Keep it SeqCst anyway unless
+            // it proves to be a bottleneck (note that there is one other possible way for them to be
+            // written to--via deleted_unused--but it shouldn't be possible for that to run with a
+            // pointer with the same address as the old one at the same time.
+            //
+            // Not sure about the store... again, keeping it SeqCst for now.
+            self.table_info.store(new_map.table_info.load(Ordering::SeqCst), Ordering::SeqCst);
+            new_map.table_info.store(ptr::null_mut(), Ordering::SeqCst);
 
-        // Rather than deleting ti now, we store it in old_table_infos. We then
-        // run a delete_unused routine to delete all the old table pointers.
-        let old_table_infos = &mut *self.old_table_infos.get();
-        old_table_infos.push(mem::transmute(ti));
-        delete_unused(old_table_infos);
-        Ok(())
+            // Rather than deleting ti now, we store it in old_table_infos. We then
+            // run a delete_unused routine to delete all the old table pointers.
+            let old_table_infos = &mut *self.old_table_infos.get();
+            old_table_infos.push(mem::transmute(ti));
+            delete_unused(old_table_infos);
+            Ok(())
+        }
     }
 }
 
