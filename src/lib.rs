@@ -223,6 +223,9 @@ fn main() {
             make_threads(&all);
         } else {
             {
+                make_threads(&delete);
+            }
+            {
                 make_threads(&insert);
             }
             {
@@ -230,9 +233,6 @@ fn main() {
             }
             {
                 make_threads(&find);
-            }
-            {
-                make_threads(&delete);
             }
         }
     }
