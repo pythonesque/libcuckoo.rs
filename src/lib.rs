@@ -105,11 +105,11 @@ fn main() {
 //pub extern fn main(argc: i32, argv: *const *const u8) -> i32 {
     //let map = CuckooHashMap::<(), (), DefaultState<FnvHasher>>::default();
     //let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::default();
-    const CAPACITY: usize = 1 << 24;
-    type Key = u64;//u32
-    type Val = bool;//[u8; 1024]
-    const RED: Val = false;//[0u8; 1024]
-    const BLACK: Val = true;//[1u8; 1024]
+    const CAPACITY: usize = 1 << 22;
+    type Key = u64;//u32;//();
+    type Val = bool;//[[u64; 8]; 16];//();
+    const RED: Val = false;//[[0 ; 8]; 16];//();
+    const BLACK: Val = true;//[[!0 ; 8]; 16];//();
     //const MAX: Key = 0x20add; // no cuckoo (133853)
     //const MAX: Key = 0x3df36; // no resize (253750) 4 * 4 * 4 * 253750
     const MAX: Key = 650_000;
@@ -155,10 +155,10 @@ fn main() {
         let ops_per_entry = OPS_PER_ENTRY_PER_TASK.transpose().map( |s| s.fold(0, Add::add) );
         let Stats { upsert, delete, insert, update, read } = ops_per_entry.map( |s| s * NUM_ENTRIES );
         let total_per_entry = ops_per_entry.fold(0, Add::add);
-        println!("threads: {}, capacity: {}, entries: {}\
+        println!("threads: {}, capacity: {}, entries: {}, key size: {}, value size: {}\
                  , upserts: {}, deletes: {}, inserts: {}, updates: {}, reads: {}\
                  , total: {}, {}% writes",
-                 NUM_THREADS, CAPACITY, NUM_ENTRIES,
+                 NUM_THREADS, CAPACITY, NUM_ENTRIES, mem::size_of::<Key>(), mem::size_of::<Val>(),
                  upsert, delete, insert, update, read,
                  total_per_entry * NUM_ENTRIES,
                  ((total_per_entry - ops_per_entry.read) as f64 / (total_per_entry as f64) * 100.0).round());
@@ -247,7 +247,7 @@ fn main() {
                         //println!("find error");
                         unsafe { intrinsics::abort(); }
                         //break 'here;
-                    };
+                    }
                     //reads += 1;
                 }
             }
