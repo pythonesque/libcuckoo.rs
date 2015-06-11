@@ -92,6 +92,7 @@ fn start(_argc: isize, _argv: *const *const u8) -> isize {
 fn main() {
     use core::intrinsics;
     use core::mem;
+    use core::ops::Add;
     use core::ptr;
     //use rustc::util::nodemap::FnvHasher;
     use std::collections::hash_state::DefaultState;
@@ -104,33 +105,82 @@ fn main() {
 //pub extern fn main(argc: i32, argv: *const *const u8) -> i32 {
     //let map = CuckooHashMap::<(), (), DefaultState<FnvHasher>>::default();
     //let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::default();
-    let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::with_capacity_and_hash_state(1 << 24, Default::default());
-    type Key = u64;
+    const CAPACITY: usize = 1 << 24;
+    type Key = u64;//u32
+    type Val = bool;//[u8; 1024]
+    const RED: Val = false;//[0u8; 1024]
+    const BLACK: Val = true;//[1u8; 1024]
     //const MAX: Key = 0x20add; // no cuckoo (133853)
     //const MAX: Key = 0x3df36; // no resize (253750) 4 * 4 * 4 * 253750
     const MAX: Key = 650_000;
     //const MAX: Key = 1_000_000;
     //const MAX: Key = 20 * 3000;
     const CORES: Key = 4;
-    const SLICE_THREADS: Key = CORES;//1;//CORES; // 1
+    const SLICE_THREADS: Key = CORES; // 1
     const NUM_THREADS: Key = 4;
     const LOAD_FACTOR: Key = 1;//6;
     const NUM_READS: Key = LOAD_FACTOR * ((CORES + NUM_THREADS - 1) / NUM_THREADS) * ((CORES + NUM_THREADS - 1) / NUM_THREADS)* SLICE_THREADS;// * 4;//60; // 48 * 4 * 4 * 20 * 3000
-    println!("threads: {}, reads: {}, writes: {}", NUM_THREADS, NUM_READS * NUM_THREADS * NUM_THREADS / SLICE_THREADS * MAX, MAX);
 
+    const NUM_ENTRIES: Key = NUM_THREADS * MAX;
+
+    #[derive(Clone,Copy)] struct Stats<S> { upsert: S, delete: S, insert: S, update: S, read: S };
+    impl<S> Stats<S> where S: Copy {
+        fn fold<B, F>(self, init: B, f: F) -> B where F: Fn(B, S) -> B {
+            let Stats { upsert, delete, insert, update, read } = self;
+            f(f(f(f(f(init, upsert), delete), insert), update), read)
+        }
+        fn map<B, F>(self, f: F) -> Stats<B> where F: Fn(S) -> B {
+            let Stats { upsert, delete, insert, update, read } = self;
+            Stats { upsert: f(upsert), delete: f(delete), insert: f(insert), update: f(update), read: f(read) }
+        }
+        const fn new(init: S) -> Self {
+            Stats { upsert: init, delete: init, insert: init, update: init, read: init }
+        }
+    }
+    impl<S> Stats<Stats<S>> where S: Copy {
+        fn transpose(self) -> Stats<Stats<S>> {
+            Stats { upsert: self.map( |s| s.upsert), delete: self.map( |s| s.delete),
+                    insert: self.map( |s| s.insert), update: self.map( |s| s.update),
+                    read: self.map( |s| s.read) }
+        }
+    }
+    const OPS_PER_ENTRY_PER_TASK: Stats<Stats<Key>> = Stats {
+        upsert: Stats { upsert: NUM_THREADS, read: NUM_THREADS - 1, .. Stats::new(0) },
+        delete: Stats { delete: 1, read: 1, .. Stats::new(0) },
+        insert: Stats { insert: 1, .. Stats::new(0) },
+        update: Stats { update: 1, .. Stats::new(0) },
+        read: Stats { read: NUM_READS / SLICE_THREADS * NUM_THREADS, .. Stats::new(0) },
+    };
+    {
+        let ops_per_entry = OPS_PER_ENTRY_PER_TASK.transpose().map( |s| s.fold(0, Add::add) );
+        let Stats { upsert, delete, insert, update, read } = ops_per_entry.map( |s| s * NUM_ENTRIES );
+        let total_per_entry = ops_per_entry.fold(0, Add::add);
+        println!("threads: {}, capacity: {}, entries: {}\
+                 , upserts: {}, deletes: {}, inserts: {}, updates: {}, reads: {}\
+                 , total: {}, {}% writes",
+                 NUM_THREADS, CAPACITY, NUM_ENTRIES,
+                 upsert, delete, insert, update, read,
+                 total_per_entry * NUM_ENTRIES,
+                 ((total_per_entry - ops_per_entry.read) as f64 / (total_per_entry as f64) * 100.0).round());
+    }
+    let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::with_capacity_and_hash_state(CAPACITY, Default::default());
     let upsert = |j: Key| {
         let range = /*if SLICE_THREADS == CORES {
             Range::new(th, th + 1)
         } else {
             */Range::new(0, NUM_THREADS)/*
         }*/;
-        //let mut upserts = 0;
+        //let mut inserts: Key = 0;
+        //let mut updates = 0;
         /*'here: */for j in range {
             for i in Range::new(j * MAX, (j + 1) * MAX) {
-                if let None = map.upsert(i, |b| { *b = true; }, false) {
+                if let None = map.upsert(i, |b| { *b = RED; }, BLACK) {
+                    //inserts += 1;
                     continue;
+                } else {
+                    //updates += 1;
                 }
-                if map.find(&i) != Some(true) {
+                if map.find(&i) != Some(RED) {
                     //println!("upsert error");
                     unsafe { intrinsics::abort(); }
                     //break 'here;
@@ -139,6 +189,8 @@ fn main() {
             }
         }
         println!("({}) upserts", j);//, upserts);
+        //Stats { upsert: inserts.wrapping_add(updates), read: updates, .. Stats::new(0) }
+        //println!("({}) {} upserts ({} inserts, {} updates, {} finds)", j, inserts.wrapping_add(updates), inserts, updates, updates);
     };
     let delete = |j: Key| {
         //let mut deletes = 0;
@@ -160,7 +212,7 @@ fn main() {
     let insert = |j: Key| {
         //let mut writes = 0;
         for i in Range::new(j * MAX, (j + 1) * MAX) {
-            if let Err(_) = map.insert(i, /*[0u8; 1024]*/false) {
+            if let Err(_) = map.insert(i, BLACK) {
                 //println!("insert error");
                 unsafe { intrinsics::abort(); }
                 //break;
@@ -172,7 +224,7 @@ fn main() {
     let update = |j: Key| {
         //let mut update = 0;
         for i in Range::new(j * MAX, (j + 1) * MAX) {
-            if map.update(&i, /*[0u8; 1024]*/true) != Ok(false) {
+            if map.update(&i, RED) != Ok(BLACK) {
                 //println!("update error");
                 unsafe { intrinsics::abort(); }
                 //break;
@@ -191,7 +243,7 @@ fn main() {
         /*'here: */for j in range {
             for _ in Range::new(0, NUM_READS) {
                 for i in Range::new(j * MAX, (j + 1) * MAX) {
-                    if map.find(&i) != Some(true) {
+                    if map.find(&i) != Some(RED) {
                         //println!("find error");
                         unsafe { intrinsics::abort(); }
                         //break 'here;
@@ -203,7 +255,10 @@ fn main() {
         println!("({}) reads", th,);// reads);
     };
 
-    unsafe fn make_threads<'a, F, T>(f: &'a F) -> [thread::JoinGuard<'a, T>; NUM_THREADS as usize] where F: Fn(Key) -> T + Send + Sync + 'a, T: Send {
+    unsafe fn make_threads<'a, F, T>(f: &'a F) -> [thread::JoinGuard<'a, T>; NUM_THREADS as usize] where
+            F: Fn(Key) -> T + Send + Sync + 'a,
+            T: Send
+    {
         let mut t: [thread::JoinGuard<T> ; NUM_THREADS as usize] = mem::uninitialized();
         for j in Range::new(0, NUM_THREADS) {
             ptr::write(t.as_mut_ptr().offset(j as isize), thread::scoped(move || f(j)));
