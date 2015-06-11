@@ -384,10 +384,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// so the result may not necessarily be exact (it may even be negative).
     pub fn size(&self) -> isize {
         let hazard_pointer = check_hazard_pointer();
-        unsafe {
-            let ti = self.snapshot_table_nolock(&hazard_pointer);
-            cuckoo_size(&ti)
-        }
+        let ti = self.snapshot_table_nolock(&hazard_pointer);
+        cuckoo_size(&ti)
     }
 
     /// empty returns true if the table is empty.
@@ -413,10 +411,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// The result may not necessarily be exact (it may even be negative).
     pub fn load_factor(&self) -> f64 {
         let hazard_pointer = check_hazard_pointer();
-        unsafe {
-            let ti = self.snapshot_table_nolock(&hazard_pointer);
-            cuckoo_loadfactor(&ti)
-        }
+        let ti = self.snapshot_table_nolock(&hazard_pointer);
+        cuckoo_loadfactor(&ti)
     }
 
     /// find searches through the table for `key`, and returns `Some(value)` if
@@ -681,8 +677,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// empty slot, adds each slot of the bucket in the b_slot. If the queue runs
     /// out of space, it fails.
     ///
-    /// Unsafe because it assumes that ti is valid, the hazard pointer is set, and i1 and i2 are in
-    /// bounds.
+    /// Unsafe because it assumes that i1 and i2 are in bounds.
     unsafe fn slot_search(&self, ti: &TableInfo<K, V>, i1: usize, i2: usize) -> BSlot {
         let mut q = BQueue::new();
         // The initial pathcode informs cuckoopath_search which bucket the path
@@ -730,8 +725,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// cuckoopath_move. Thus cuckoopath_move checks that the data matches the
     /// cuckoo path before changing it.
     ///
-    /// Unsafe because it assumes that ti is valid, the hazard pointer is set, and i1 and i2 are in
-    /// bounds.
+    /// Unsafe because it assumes that i1 and i2 are in bounds.
     unsafe fn cuckoopath_search(&self, ti: &TableInfo<K, V>,
                                 cuckoo_path: &mut [CuckooRecord<K>; MAX_BFS_PATH_LEN as usize],
                                 i1: usize, i2: usize)
@@ -859,8 +853,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// function. If run_cuckoo returns ok (success), then the slot it freed up
     /// is still locked. Otherwise it is unlocked.
     ///
-    /// Unsafe because it assumes that ti is valid, the hazard pointer is set, the locks are taken, and
-    /// i1 and i2 are in bounds.
+    /// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
     unsafe fn run_cuckoo(&self,
                          ti: &TableInfo<K, V>, i1: usize, i2: usize)
                          -> Result<(usize, usize), CuckooError> where
@@ -927,8 +920,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// hashing presents multiple concurrency issues, which are explained in the
     /// function.
     ///
-    /// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be
-    /// set, and i1 and i2 to be in bounds.
+    /// Unsafe because it expects the locks to be taken and i1 and i2 to be in bounds.
     unsafe fn cuckoo_insert(&self,
                             key: K, val: V,
                             hv: usize, snapshot: LockTwo<K, V>) -> InsertResult<(), K, V> where
@@ -1000,8 +992,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// we pulled out the loop to avoid duplicating it. This should be called
     /// directly after snapshot_and_lock_two.
     ///
-    /// Unsafe because it expects the locks to be taken, ti to be appropriately set,
-    /// and i1 and i2 to be in bounds.
+    /// Unsafe because it expects the locks to be taken and i1 and i2 to be in bounds.
     unsafe fn cuckoo_insert_loop<'a>(&self, hazard_pointer: &'a HazardPointer,
                                      mut key: K, mut val: V,
                                      hv: usize,
@@ -1064,8 +1055,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         /// insert_into_table is a helper function used by cuckoo_expand_simple to
         /// fill up the new table.
         ///
-        /// Unsafe because it expects the old table to be locked, ti to be valid,
-        /// the hazard pointer to be set, and i and end to be in bounds.
+        /// Unsafe because it expects the old table to be locked and i and end to be in bounds.
         unsafe fn insert_into_table<'a, K, V, S>(new_map: &CuckooHashMap<K, V, S>,
                                                  TI(old_ti): TI<K, V>,
                                                  //old_ti: HazardPointerSet<'a, TableInfo<K, V>>,
@@ -1246,8 +1236,7 @@ struct LockTwo<'a, K, V> {
 }
 
 impl<'a, K, V> LockTwo<'a, K, V> {
-    /// Unsafe because it assumes that ti is valid, the hazard pointer has been taken, and i is in
-    /// bounds.
+    /// Unsafe because it assumes that i1 and i2 are in bounds.
     unsafe fn release(self) {
         unlock_two(&self.ti, self.i1, self.i2);
     }
@@ -1255,8 +1244,7 @@ impl<'a, K, V> LockTwo<'a, K, V> {
 
 /// lock locks the given bucket index.
 ///
-/// Unsafe because it assumes that ti is valid, the hazard pointer has been taken, and i is in
-/// bounds.
+/// Unsafe because it assumes that i is in bounds.
 #[inline(always)]
 unsafe fn lock<K, V>(ti: &TableInfo<K, V>, i: usize) {
     ti.locks.get_unchecked(lock_ind(i)).lock();
@@ -1264,8 +1252,7 @@ unsafe fn lock<K, V>(ti: &TableInfo<K, V>, i: usize) {
 
 /// unlock unlocks the given bucket index.
 ///
-/// Unsafe because it assumes that ti is valid, the hazard pointer has been taken, i is in bounds,
-/// and the lock is taken.
+/// Unsafe because it assumes that i is in bounds and locked.
 #[inline(always)]
 unsafe fn unlock<K, V>(ti: &TableInfo<K, V>, i: usize) {
     ti.locks.get_unchecked(lock_ind(i)).unlock();
@@ -1275,8 +1262,7 @@ unsafe fn unlock<K, V>(ti: &TableInfo<K, V>, i: usize) {
 /// first to avoid deadlock. If the two indexes are the same, it just locks
 /// one.
 ///
-/// Unsafe because it assumes that ti is valid, the hazard pointer has been taken, and i1 and i2
-/// are in bounds.
+/// Unsafe because it assumes that i1 and i2 are in bounds.
 unsafe fn lock_two<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize) {
     let i1 = lock_ind(i1);
     let i2 = lock_ind(i2);
@@ -1308,8 +1294,7 @@ unsafe fn lock_two<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize) {
 /// unlock_two unlocks both of the given bucket indexes, or only one if they
 /// are equal. Order doesn't matter here.
 ///
-/// Unsafe because it assumes that ti is valid, the hazard pointer has been taken, i1 and i2
-/// are in bounds, and the locks are taken.
+/// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
 unsafe fn unlock_two<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize) {
     let i1 = lock_ind(i1);
     let i2 = lock_ind(i2);
@@ -1322,8 +1307,7 @@ unsafe fn unlock_two<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize) {
 
 /// lock_three locks the three bucket indexes in numerical order.
 ///
-/// Unsafe because it assumes that ti is valid, the hazard pointer has been taken, and i1, i2, and
-/// i3 are in bounds.
+/// Unsafe because it assumes that i1, i2, and i3 are in bounds.
 unsafe fn lock_three<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize, i3: usize) {
     let i1 = lock_ind(i1);
     let i2 = lock_ind(i2);
@@ -1407,8 +1391,7 @@ unsafe fn lock_three<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize, i3: usize
 
 /// unlock_three unlocks the three given buckets
 ///
-/// Unsafe because it assumes that ti is valid, the hazard pointer has been taken, i1, i2, and
-/// i3 are in bounds, and all the locks are taken.
+/// Unsafe because it assumes that i1, i2, and i3 are in bounds, and all the locks are taken.
 unsafe fn unlock_three<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize, i3: usize) {
     let i1 = lock_ind(i1);
     let i2 = lock_ind(i2);
@@ -1433,8 +1416,7 @@ struct AllUnlocker<'a, K, V> where
 }
 
 impl<'a, K, V> AllUnlocker<'a, K, V> {
-    /// Unsafe because it assumes ti will be unaliased on drop if not null, and this is not
-    /// enforced; also assumes that all of ti's locks are taken.
+    /// Unsafe because it assumes that all of ti's locks are taken.
     unsafe fn new(ti: &'a TableInfo<K, V>) -> Self {
         AllUnlocker { ti: ti }
     }
@@ -1482,10 +1464,8 @@ fn hashed_key<K: ?Sized, S>(hash_state: &S, key: &K) -> usize where
 
 /// index_hash returns the first possible bucket that the given hashed key
 /// could be.
-///
-/// Unsafe because it assumes that ti is valid and the hazard pointer is set.
 #[inline(always)]
-unsafe fn index_hash<K, V>(ti: &TableInfo<K, V>, hv: usize) -> usize {
+fn index_hash<K, V>(ti: &TableInfo<K, V>, hv: usize) -> usize {
     hv & hashmask(ti.hashpower)
 }
 
@@ -1494,10 +1474,8 @@ unsafe fn index_hash<K, V>(ti: &TableInfo<K, V>, hv: usize) -> usize {
 /// this function will return the first possible bucket if index is the
 /// second possible bucket, so alt_index(ti, hv, alt_index(ti, hv,
 /// index_hash(ti, hv))) == index_hash(ti, hv).
-///
-/// Unsafe because it assumes that ti is valid and the hazard pointer is set.
 #[inline(always)]
-unsafe fn alt_index<K, V>(ti: &TableInfo<K, V>, hv: usize, index: usize) -> usize {
+fn alt_index<K, V>(ti: &TableInfo<K, V>, hv: usize, index: usize) -> usize {
     // ensure tag is nonzero for the multiply
     // TODO: figure out if this is UB and how to mitigate it if so.
     let tag = (hv >> ti.hashpower).wrapping_add(1);
@@ -1643,8 +1621,7 @@ impl BQueue{
 /// Note that if i1 or i2 is equal to cuckoo_path[0].bucket and depth == 0, this will deadlock,
 /// though this is not technically a safety issue.
 ///
-/// Unsafe because it assumes ti is valid, hazard pointer is set, i1 and i2 are in bounds, and
-/// depth is in bounds.
+/// Unsafe because it assumes i1 and i2 are in bounds, and depth is in bounds.
 unsafe fn cuckoopath_move<K, V>(ti: &TableInfo<K, V>,
                                 cuckoo_path: &[CuckooRecord<K> ; MAX_BFS_PATH_LEN as usize],
                                 mut depth: usize, i1: usize, i2: usize) -> bool where
@@ -1731,8 +1708,7 @@ unsafe fn cuckoopath_move<K, V>(ti: &TableInfo<K, V>,
 /// try_read_from_bucket will search the bucket for the given key and store
 /// the associated value if it finds it.
 ///
-/// Unsafe because it assumes ti is valid, locks are taken, hazard pointer is set, and i is in
-/// bounds.
+/// Unsafe because it assumes i is in bounds and locked.
 unsafe fn try_read_from_bucket<K, V, P>
                               (ti: &TableInfo<K, V>, _partial: P,
                                key: &K, i: usize) -> Option<V> where
@@ -1758,8 +1734,7 @@ unsafe fn try_read_from_bucket<K, V, P>
 /// check_in_bucket will search the bucket for the given key and return true
 /// if the key is in the bucket, and false if it isn't.
 ///
-/// Unsafe because it assumes ti is valid, locks are taken, hazard pointer is set, and i is in
-/// bounds.
+/// Unsafe because it assumes i is in bounds and locked.
 unsafe fn check_in_bucket<K, V, P>
                          (ti: &TableInfo<K, V>, _partial: P,
                           key: &K, i: usize) -> bool where
@@ -1783,10 +1758,7 @@ unsafe fn check_in_bucket<K, V, P>
 
 /// add_to_bucket will insert the given key-value pair into the slot.
 ///
-/// This function is unsafe because it relies on ti being correctly set, the hazard pointer being
-/// set, the correct locks having been taken, and the indexes having been chosen correctly (in the
-/// original version, this last bit is *sort of* checked, but not really [there's no bounds
-/// checking]).
+/// Unsafe because it assumes i and j are in bounds, i is locked, and j is not occupied.
 unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
                                  key: K, val: V,
                                  i: usize, j: usize) where
@@ -1812,8 +1784,7 @@ unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
 /// search the entire bucket and return false if it finds the key already in
 /// the table (duplicate key error) and true otherwise.
 ///
-/// This function is unsafe because it relies on ti being correctly set, the hazard pointer being
-/// set, the correct locks having been taken, and the indexes having been chosen correctly.
+/// Unsafe because it assumes i is in bounds and locked.
 unsafe fn try_find_insert_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
                                           key: &K,
                                           i: usize)
@@ -1842,8 +1813,7 @@ unsafe fn try_find_insert_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
 /// try_del_from_bucket will search the bucket for the given key, and set the
 /// slot of the key to empty if it finds it.
 ///
-/// This function is unsafe because it relies on ti being correctly set, the hazard pointer being
-/// set, the correct locks having been taken, and the index being in bounds.
+/// Unsafe because it assumes i is in bounds and locked.
 unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
                                        key: &K,
                                        i: usize)
@@ -1874,8 +1844,7 @@ unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
 /// try_update_bucket will search the bucket for the given key and change its
 /// associated value if it finds it.
 ///
-/// This function is unsafe because it relies on ti being correctly set, the hazard pointer being
-/// set, the correct locks having been taken, and the index being in bounds.
+/// Unsafe because it assumes i is in bounds and locked.
 unsafe fn try_update_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
                                      key: &K, value: V, i: usize)
                                      -> Result<V, V> where
@@ -1902,8 +1871,7 @@ unsafe fn try_update_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
 /// try_update_bucket_fn will search the bucket for the given key and change
 /// its associated value with the given function if it finds it.
 ///
-/// This function is unsafe because it relies on ti being correctly set, the hazard pointer being
-/// set, the correct locks having been taken, and the index being in bounds.
+/// Unsafe because it assumes i is in bounds and locked.
 unsafe fn try_update_bucket_fn<K, V, P, F, T>(ti: &TableInfo<K, V>, _partial: P,
                                               key: &K, updater: &mut F, i: usize)
                                               -> Option<T> where
@@ -1932,8 +1900,7 @@ unsafe fn try_update_bucket_fn<K, V, P, F, T>(ti: &TableInfo<K, V>, _partial: P,
 /// value in the val if it finds the key. It expects the locks to be taken
 /// and released outside the function.
 ///
-/// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be
-/// set, and i1 and i2 to be in bounds.
+/// Unsafe because it expects the locks to be taken, and i1 and i2 to be in bounds.
 unsafe fn cuckoo_find<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -> Option<V> where
         K: Copy + Eq,
         V: Copy,
@@ -1948,8 +1915,7 @@ unsafe fn cuckoo_find<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -> Op
 /// it's in the table and false otherwise. It expects the locks to be taken
 /// and released outside the function.
 ///
-/// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be
-/// set, and i1 and i2 to be in bounds.
+/// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
 unsafe fn cuckoo_contains<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -> bool where
         K: Copy + Eq,
 {
@@ -1963,8 +1929,7 @@ unsafe fn cuckoo_contains<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -
 /// that key to empty if it finds it. It expects the locks to be taken and
 /// released outside the function.
 ///
-/// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be set,
-/// and i1 and i2 to be in bounds.
+/// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
 unsafe fn cuckoo_delete<K, V>(key: &K,
                               _hv: usize, snapshot: &LockTwo<K, V>) -> Option<V> where
         K: Eq,
@@ -1981,8 +1946,7 @@ unsafe fn cuckoo_delete<K, V>(key: &K,
 /// if it finds it. It expects the locks to be taken and released outside the
 /// function.
 ///
-/// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be set,
-/// and i1 and i2 to be in bounds.
+/// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
 unsafe fn cuckoo_update<K,V>(key: &K, val: V,
                              _hv: usize, snapshot: &LockTwo<K, V>) -> Result<V, V> where
         K: Eq,
@@ -2001,8 +1965,7 @@ unsafe fn cuckoo_update<K,V>(key: &K, val: V,
 /// function to the value. It expects the locks to be taken and released
 /// outside the function.
 ///
-/// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be set,
-/// and i1 and i2 to be in bounds.
+/// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
 unsafe fn cuckoo_update_fn<K, V, F, T>(key: &K, updater: &mut F,
                                        _hv: usize, snapshot: &LockTwo<K, V>) -> Option<T> where
         K: Eq,
@@ -2017,16 +1980,15 @@ unsafe fn cuckoo_update_fn<K, V, F, T>(key: &K, updater: &mut F,
 }
 
 /// cuckoo_size returns the number of elements in the given table.
-/// Unsafe because it assumes that ti is valid and that the snapshot has been taken.
 /// The number of elements is approximate and may be negative.
-unsafe fn cuckoo_size<K, V>(ti: &TableInfo<K, V>) -> isize {
+fn cuckoo_size<K, V>(ti: &TableInfo<K, V>) -> isize {
     let mut inserts = 0usize;
     let mut deletes = 0usize;
 
     let mut insert = ti.num_inserts.iter();
     let mut delete = ti.num_deletes.iter();
     while let Some(insert) = insert.next() {
-        let delete = delete.next().unwrap_or_else(|| intrinsics::unreachable());
+        let delete = unsafe { delete.next().unwrap_or_else(|| intrinsics::unreachable()) };
         // We use unordered loads here because we don't care about accuracy and grabbing ti should
         // have given us enough of a fence to ensure memory safety.
         inserts = inserts.wrapping_add(insert.load_unordered());
@@ -2036,9 +1998,8 @@ unsafe fn cuckoo_size<K, V>(ti: &TableInfo<K, V>) -> isize {
 }
 
 /// cuckoo_loadfactor returns the load factor of the given table.
-/// Unsafe because it assumes that ti is valid and that the snapshot has been taken.
 /// The load factor is approximate and may be negative.
-unsafe fn cuckoo_loadfactor<K, V>(ti: &TableInfo<K, V>) -> f64 {
+fn cuckoo_loadfactor<K, V>(ti: &TableInfo<K, V>) -> f64 {
     cuckoo_size(ti) as f64 / SLOT_PER_BUCKET as f64 / hashsize(ti.hashpower) as f64
 }
 
