@@ -1,11 +1,33 @@
 use std::cell::{Cell, UnsafeCell};
 use std::intrinsics;
+use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use super::mutex::{MUTEX_INIT, StaticMutex};
 
 //#[derive(Clone,Copy)]
 pub struct HazardPointer(pub UnsafeCell<usize>);
+
+//#[derive(Clone,Copy)]
+pub struct HazardPointerSet<'a, T> {
+    pub ti: *mut T,
+    marker: PhantomData<&'a HazardPointer>,
+}
+
+impl HazardPointer {
+    /// Unsafe because it does not verify in advance that the hazard pointer is being set to a
+    /// valid value, or that it was not already set for some reason.
+    pub unsafe fn set<'a, T>(&'a self, ti: *mut T) -> HazardPointerSet<'a, T> {
+        // Monotonic store should be okay since it's followed by a SeqCst load (which
+        // has acquire semantics) though it might make more sense to put the Acquire
+        // here.
+        // For now we use SeqCst to stay on the safe side.
+        // NOTE: This is definitely a huge bottleneck!  Seriously investigate relaxing
+        // this to release.
+        intrinsics::atomic_store_rel(self.0.get(), ti as usize);
+        HazardPointerSet { marker: PhantomData, ti: ti }
+    }
+}
 
 //pub type Gc(*mut UnsafeCell<>);
 

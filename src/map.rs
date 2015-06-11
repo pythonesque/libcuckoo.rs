@@ -13,7 +13,7 @@ use std::ptr;
 use std::thread;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use super::iter::Range;
-use super::hazard_pointer::{check_hazard_pointer, delete_unused, HazardPointer};
+use super::hazard_pointer::{check_hazard_pointer, delete_unused, HazardPointer, HazardPointerSet};
 use super::spinlock::SpinLock;
 use super::sys::arch::cpuid;
 
@@ -222,7 +222,7 @@ struct TableInfo<K, V> {
     hashpower: usize,
 
     /// vector of buckets
-    buckets: Vec<Bucket<K, V>>,
+    buckets: Vec<UnsafeCell<Bucket<K, V>>>,
 
     /// array of locks
     locks: [SpinLock ; K_NUM_LOCKS],
@@ -270,7 +270,7 @@ impl<K, V> TableInfo<K, V> {
             let ti = box UnsafeCell {
                 value: TableInfo {
                     hashpower: hashpower,
-                    buckets: from_fn(hashsize(hashpower), || Bucket::new()),
+                    buckets: from_fn(hashsize(hashpower), || UnsafeCell { value: Bucket::new() }),
                     locks: mem::uninitialized(),
                     num_inserts: from_fn(num_cpus, || CacheInt::new()),
                     num_deletes: from_fn(num_cpus, || CacheInt::new()),
@@ -361,7 +361,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             // elements it removes from the table. It assumes the locks are taken as
             // necessary.
             for bucket in &mut (*ti).buckets {
-                bucket.clear();
+                (*bucket.get()).clear();
             }
             let mut insert = (*ti).num_inserts.iter();
             let mut delete = (*ti).num_deletes.iter();
@@ -379,7 +379,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     pub fn size(&self) -> isize {
         let hazard_pointer = check_hazard_pointer();
         unsafe {
-            let ti = self.snapshot_table_nolock(&hazard_pointer);
+            let HazardPointerSet { ti, .. } = self.snapshot_table_nolock(&hazard_pointer);
             cuckoo_size(ti)
         }
     }
@@ -394,19 +394,13 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     pub fn hashpower(&self) -> usize {
         let hazard_pointer = check_hazard_pointer();
         unsafe {
-            let ti = self.snapshot_table_nolock(&hazard_pointer);
+            let HazardPointerSet { ti, .. } = self.snapshot_table_nolock(&hazard_pointer);
             (*ti).hashpower
         }
     }
 
     /// bucket_count returns the number of buckets in the table.
     pub fn bucket_count(&self) -> usize {
-        /*
-        let hazard_pointer = check_hazard_pointer();
-        unsafe {
-            let ti = self.snapshot_table_nolock(&hazard_pointer);
-            hashsize((&*ti).hashpower)
-        }*/
         hashsize(self.hashpower())
     }
 
@@ -416,7 +410,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     pub fn load_factor(&self) -> f64 {
         let hazard_pointer = check_hazard_pointer();
         unsafe {
-            let ti = self.snapshot_table_nolock(&hazard_pointer);
+            let HazardPointerSet { ti, .. } = self.snapshot_table_nolock(&hazard_pointer);
             cuckoo_loadfactor(ti)
         }
     }
@@ -430,10 +424,10 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
-            let st = cuckoo_find(key, hv, ti, i1, i2);
-            unlock_two(ti, i1, i2);
+            let st = cuckoo_find(key, hv, &snapshot);
+            snapshot.release();
             st
         }
     }
@@ -446,10 +440,10 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
-            let result = cuckoo_contains(key, hv, ti, i1, i2);
-            unlock_two(ti, i1, i2);
+            let result = cuckoo_contains(key, hv, &snapshot);
+            snapshot.release();
             result
         }
     }
@@ -469,8 +463,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         check_counterid();
         let hv = hashed_key(&self.hash_state, &key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
-            self.cuckoo_insert_loop(&hazard_pointer, key, v, hv, ti, i1, i2)
+            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            self.cuckoo_insert_loop(&hazard_pointer, key, v, hv, snapshot)
         }
     }
 
@@ -482,10 +476,10 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         check_counterid();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
-            let result = cuckoo_delete(key, hv, ti, i1, i2);
-            unlock_two(ti, i1, i2);
+            let result = cuckoo_delete(key, hv, &snapshot);
+            snapshot.release();
             result
         }
     }
@@ -498,10 +492,10 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
-            let result = cuckoo_update(key, val, hv, ti, i1, i2);
-            unlock_two(ti, i1, i2);
+            let result = cuckoo_update(key, val, hv, &snapshot);
+            snapshot.release();
             result
         }
     }
@@ -517,10 +511,10 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
-            let result = cuckoo_update_fn(key, &mut updater, hv, ti, i1, i2);
-            unlock_two(ti, i1, i2);
+            let result = cuckoo_update_fn(key, &mut updater, hv, &snapshot);
+            snapshot.release();
             result
         }
     }
@@ -541,14 +535,14 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hv = hashed_key(&self.hash_state, &key);
         unsafe {
             loop {
-                let (ti, i1, i2) = self.snapshot_and_lock_two(&hazard_pointer, hv);
-                match cuckoo_update_fn(&key, &mut updater, hv, ti, i1, i2) {
+                let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
+                match cuckoo_update_fn(&key, &mut updater, hv, &snapshot) {
                     v @ Some(_) => {
-                        unlock_two(ti, i1, i2);
+                        snapshot.release();
                         return v;
                     },
                     // We run an insert, since the update failed
-                    None => match self.cuckoo_insert_loop(&hazard_pointer, key, val, hv, ti, i1, i2) {
+                    None => match self.cuckoo_insert_loop(&hazard_pointer, key, val, hv, snapshot) {
                         Ok(()) => return None,
                         // The only valid reason for res being false is if insert
                         // encountered a duplicate key after releasing the locks and
@@ -578,7 +572,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         unsafe {
-            let ti = self.snapshot_table_nolock(&hazard_pointer);
+            let HazardPointerSet { ti, .. } = self.snapshot_table_nolock(&hazard_pointer);
             if n <= (*ti).hashpower {
                 Err(())
             } else {
@@ -600,7 +594,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         unsafe {
-            let ti = self.snapshot_table_nolock(&hazard_pointer);
+            let HazardPointerSet { ti, .. } = self.snapshot_table_nolock(&hazard_pointer);
             if n <= hashsize((*ti).hashpower).wrapping_mul(SLOT_PER_BUCKET) {
                 Err(())
             } else {
@@ -619,28 +613,20 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// issue, where the address of the new table_info equals the address of a
     /// previously deleted one, however it doesn't matter, since we would still
     /// be looking at the most recent table_info in that case.
-    fn snapshot_table_nolock(&self, hazard_pointer: &HazardPointer)
-                                    -> *mut TableInfo<K, V> {
-        unsafe {
-            loop {
-                let ti = self.table_info.load(Ordering::SeqCst);
-                /*unsafe */{
-                    // Monotonic store should be okay since it's followed by a SeqCst load (which
-                    // has acquire semantics) though it might make more sense to put the Acquire
-                    // here.
-                    // For now we use SeqCst to stay on the safe side.
-                    // NOTE: This is definitely a huge bottleneck!  Seriously investigate relaxing
-                    // this to release.
-                    intrinsics::atomic_store_rel(hazard_pointer.0.get(), ti as usize);
-                }
+    fn snapshot_table_nolock<'a>(&'a self, hazard_pointer: &'a HazardPointer)
+                                 -> HazardPointerSet<'a, TableInfo<K, V>> {
+        loop {
+            return unsafe {
+                let ti_ = self.table_info.load(Ordering::SeqCst);
+                let ti = hazard_pointer.set(ti_);
                 // If the table info has changed in the time we set the hazard
                 // pointer, ti could have been deleted, so try again.
                 // Note that this should provide an acquire fence for the previous operation.
-                if ti != self.table_info.load(Ordering::SeqCst) {
+                if ti_ != self.table_info.load(Ordering::SeqCst) {
                     continue;
                 }
-                return ti;
-            }
+                ti
+            };
         }
     }
 
@@ -650,34 +636,23 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// depends on the number of buckets in the table, the table_info pointer
     /// needs to be grabbed first.
     fn snapshot_and_lock_two(&self, hazard_pointer: &HazardPointer, hv: usize)
-                                    -> (*mut TableInfo<K, V>, usize, usize) {
-        unsafe {
-            loop {
-                let ti = self.table_info.load(Ordering::SeqCst);
-                /*unsafe */{
-                    // Monotonic store should be okay since it's followed by a SeqCst load (which
-                    // has acquire semantics) though it might make more sense to put the Acquire
-                    // here.
-                    // For now we use SeqCst to stay on the safe side.
-                    // NOTE: This is definitely a huge bottleneck!  Seriously investigate relaxing
-                    // this to release.
-                    intrinsics::atomic_store_rel(hazard_pointer.0.get(), ti as usize);
-                }
-                // If the table info has changed in the time we set the hazard
-                // pointer, ti could have been deleted, so try again.
-                if ti != self.table_info.load(Ordering::SeqCst) {
-                    continue;
-                }
-                let i1 = index_hash(ti, hv);
-                let i2 = alt_index(ti, hv, i1);
+                                    -> LockTwo<K, V> {
+        loop {
+            let HazardPointerSet { ti, .. } = self.snapshot_table_nolock(hazard_pointer);
+            let (i1, i2);
+            unsafe {
+                i1 = index_hash(ti, hv);
+                i2 = alt_index(ti, hv, i1);
                 lock_two(ti, i1, i2);
-                // Check the table info again
-                if ti != self.table_info.load(Ordering::SeqCst) {
-                    unlock_two(ti, i1, i2);
-                    continue;
-                }
-                return (ti, i1, i2);
             }
+            // Check the table info again
+            if ti != self.table_info.load(Ordering::SeqCst) {
+                unsafe {
+                    unlock_two(ti, i1, i2);
+                }
+                continue;
+            }
+            return LockTwo { ti: ti, i1: i1, i2: i2 };
         }
     }
 
@@ -685,36 +660,23 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// takes all the locks in the table.
     fn snapshot_and_lock_all(&self, hazard_pointer: &HazardPointer)
                              -> *mut TableInfo<K, V> {
-        unsafe {
-            loop {
-                let ti = self.table_info.load(Ordering::SeqCst);
-                /*unsafe */{
-                    // Monotonic store should be okay since it's followed by a SeqCst load (which
-                    // has acquire semantics) though it might make more sense to put the Acquire
-                    // here.
-                    // For now we use SeqCst to stay on the safe side.
-                    // NOTE: This is definitely a huge bottleneck!  Seriously investigate relaxing
-                    // this to release.
-                    intrinsics::atomic_store_rel(hazard_pointer.0.get(), ti as usize);
+        loop {
+            let HazardPointerSet { ti, .. } = self.snapshot_table_nolock(hazard_pointer);
+            let locks;
+            unsafe {
+                locks = &(*ti).locks;
+                for lock in &locks[..] {
+                    lock.lock();
                 }
-                // If the table info has changed, ti could have been deleted, so try
-                // again
-                if ti != self.table_info.load(Ordering::SeqCst) {
-                    continue;
-                }
-                /*unsafe */{
-                    let locks = &(*ti).locks;
-                    for lock in &locks[..] {
-                        lock.lock();
-                    }
-                }
-                // If the table info has changed, unlock the locks and try again.
-                if ti != self.table_info.load(Ordering::SeqCst) {
-                    let _au = AllUnlocker::new(ti);
-                    continue;
-                }
-                return ti;
             }
+            // If the table info has changed, unlock the locks and try again.
+            if ti != self.table_info.load(Ordering::SeqCst) {
+                unsafe {
+                    let _au = AllUnlocker::new(ti);
+                }
+                continue;
+            }
+            return ti;
         }
     }
 
@@ -739,7 +701,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 if q.full() { break; }
                 let slot = (starting_slot.wrapping_add(i)) % SLOT_PER_BUCKET;
                 lock(ti, x.bucket);
-                let bucket = (*ti).buckets.get_unchecked(x.bucket);
+                let bucket = &*(*ti).buckets.get_unchecked(x.bucket).get();
                 if !bucket.occupied(slot) {
                     // We can terminate the search here
                     x.pathcode = x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(slot);
@@ -809,7 +771,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         while curr != end {
             (*curr).bucket = i;
             lock(ti, i);
-            let bucket = (*ti).buckets.get_unchecked(i);
+            let bucket = &*(*ti).buckets.get_unchecked(i).get();
             if !bucket.occupied((*curr).slot) {
                 // We can terminate here
                 unlock(ti, i);
@@ -973,38 +935,37 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// set, and i1 and i2 to be in bounds.
     unsafe fn cuckoo_insert(&self,
                             key: K, val: V,
-                            hv: usize, ti: *mut TableInfo<K, V>,
-                            i1: usize, i2: usize) -> InsertResult<(), K, V> where
+                            hv: usize, snapshot: LockTwo<K, V>) -> InsertResult<(), K, V> where
             K: Copy + Eq,
     {
         //const partial_t partial = partial_key(hv);
         let partial = ();
-        match try_find_insert_bucket(ti, partial, &key, i1) {
+        match try_find_insert_bucket(snapshot.ti, partial, &key, snapshot.i1) {
             Err(KeyDuplicated) => {
-                unlock_two(ti, i1, i2);
+                snapshot.release();
                 return Err((KeyDuplicated, key, val));
             },
-            res1 => match try_find_insert_bucket(ti, partial, &key, i2) {
+            res1 => match try_find_insert_bucket(snapshot.ti, partial, &key, snapshot.i2) {
                 Err(KeyDuplicated) => {
-                    unlock_two(ti, i1, i2);
+                    snapshot.release();
                     return Err((KeyDuplicated, key, val));
                 },
                 res2 => {
                     if let Ok(res1) = res1 {
-                        add_to_bucket(ti, partial, key, val, i1, res1);
-                        unlock_two(ti, i1, i2);
+                        add_to_bucket(snapshot.ti, partial, key, val, snapshot.i1, res1);
+                        snapshot.release();
                         return Ok(());
                     }
                     if let Ok(res2) = res2 {
-                        add_to_bucket(ti, partial, key, val, i2, res2);
-                        unlock_two(ti, i1, i2);
+                        add_to_bucket(snapshot.ti, partial, key, val, snapshot.i2, res2);
+                        snapshot.release();
                         return Ok(());
                     }
                 }
             }
         }
         // we are unlucky, so let's perform cuckoo hashing
-        match self.run_cuckoo(ti, i1, i2) {
+        match self.run_cuckoo(snapshot.ti, snapshot.i1, snapshot.i2) {
             Err(CuckooError::UnderExpansion) => {
                 // The run_cuckoo operation operated on an old version of the table,
                 // so we have to try again. We signal to the calling insert method
@@ -1020,13 +981,13 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 // Since we unlocked the buckets during run_cuckoo, another insert
                 // could have inserted the same key into either i1 or i2, so we
                 // check for that before doing the insert.
-                if cuckoo_contains(&key, hv, ti, i1, i2) {
-                    unlock_two(ti, i1, i2);
+                if cuckoo_contains(&key, hv, &snapshot) {
+                    snapshot.release();
                     return Err((KeyDuplicated, key, val));
                 }
-                add_to_bucket(ti, partial, key, val,
+                add_to_bucket(snapshot.ti, partial, key, val,
                               insert_bucket, insert_slot);
-                unlock_two(ti, i1, i2);
+                snapshot.release();
                 Ok(())
             },
             Err(CuckooError::TableFull) => {
@@ -1046,16 +1007,21 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// Unsafe because it expects the locks to be taken, ti to be appropriately set,
     /// and i1 and i2 to be in bounds.
     unsafe fn cuckoo_insert_loop(&self, hazard_pointer: &HazardPointer,
-                                 key: K, val: V,
-                                 hv: usize, ti: *mut TableInfo<K, V>,
-                                 i1: usize, i2: usize) -> InsertResult<(), K, V>
-        where K: Copy + Send + Sync,
-              V: Send + Sync,
-              S: Default + Send + Sync,
+                                 mut key: K, mut val: V,
+                                 hv: usize,
+                                 mut snapshot: LockTwo<K, V>)
+                                 //mut snapshot: LockTwo<K, V>)
+                                 -> InsertResult<(), K, V> where
+            K: Copy + Send + Sync,
+            V: Send + Sync,
+            S: Default + Send + Sync,
     {
-        let mut res = self.cuckoo_insert(key, val, hv, ti, i1, i2);
+        // TODO: investigate this claim:
+        //   "by the end of the function, the hazard pointer will have been unset."
         loop {
-            let (key, val) = match res {
+            let hashpower = (*snapshot.ti).hashpower;
+            let res = self.cuckoo_insert(key, val, hv, snapshot);
+            let (key_, val_) = match res {
                 // If the insert failed with failure_key_duplicated, it returns here
                 Err((KeyDuplicated, key, val)) => return Err((KeyDuplicated, key, val)),
                 // If it failed with failure_under_expansion, the insert operated on
@@ -1065,8 +1031,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 // again.
                 Err((TableFull, key, val)) => {
                     // TODO: Investigate whether adding 1 is alaways safe here.
-                    let hashpower = (*ti).hashpower.checked_add(1)
-                                                   .unwrap_or_else( || {
+                    let hashpower = hashpower.checked_add(1)
+                                             .unwrap_or_else( || {
                         //println!("capacity error: off by one in cuckoo_insert_loop");
                         intrinsics::abort()
                     });
@@ -1078,8 +1044,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 },
                 Ok(()) => return Ok(())
             };
-            let (ti, i1, i2) = self.snapshot_and_lock_two(hazard_pointer, hv);
-            res = self.cuckoo_insert(key, val, hv, ti, i1, i2);
+            key = key_;
+            val = val_;
+            snapshot = self.snapshot_and_lock_two(hazard_pointer, hv);
         }
     }
 
@@ -1121,10 +1088,10 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 if x % 100000 == 0 {
                     //println!("x: {} ({}..{})", x + i, i, e);
                 }
-                let kv = (*bucket).kv.as_mut().unwrap_or_else( || intrinsics::unreachable());
+                let kv = (*(*bucket).get()).kv.as_mut().unwrap_or_else( || intrinsics::unreachable());
                 let mut keys = kv.keys.as_mut_ptr();
                 let mut vals = kv.vals.as_mut_ptr();
-                for occupied in &mut (*bucket).occupied {
+                for occupied in &mut (*(*bucket).get()).occupied {
                     if *occupied {
                         *occupied = false;
                         let key = ptr::read(keys);
@@ -1272,6 +1239,20 @@ impl<K, V> CuckooHashMap<K, V, DefaultState<SipHasher>> where
 {
     fn new() -> Self {
         Default::default()
+    }
+}
+
+struct LockTwo<K, V> {
+    ti: *mut TableInfo<K, V>,
+    i1: usize,
+    i2: usize,
+}
+
+impl<K, V> LockTwo<K, V> {
+    /// Unsafe because it assumes that ti is valid, the hazard pointer has been taken, and i is in
+    /// bounds.
+    unsafe fn release(self) {
+        unlock_two(self.ti, self.i1, self.i2);
     }
 }
 
@@ -1684,7 +1665,7 @@ unsafe fn cuckoopath_move<K, V>(ti: *mut TableInfo<K, V>,
         let bucket = cuckoo_path.get_unchecked(0).bucket;
         // debug_assert!(bucket == i1 || bucket == i2);
         lock_two(ti, i1, i2);
-        return if !(*ti).buckets.get_unchecked(bucket).occupied(cuckoo_path.get_unchecked(0).slot) {
+        return if !(*(*ti).buckets.get_unchecked(bucket).get()).occupied(cuckoo_path.get_unchecked(0).slot) {
             true
         } else {
             unlock_two(ti, i1, i2);
@@ -1717,8 +1698,8 @@ unsafe fn cuckoopath_move<K, V>(ti: *mut TableInfo<K, V>,
         // may have already been filled in by another thread, or the slot we
         // are moving from may be empty, both of which invalidate the swap.
         // &mut is safe because we have tkaen the locks.
-        let bucket_fb = (*ti).buckets.get_unchecked_mut(fb);
-        let bucket_tb = (*ti).buckets.get_unchecked_mut(tb);
+        let bucket_fb = &mut *(*ti).buckets.get_unchecked_mut(fb).get();
+        let bucket_tb = &mut *(*ti).buckets.get_unchecked_mut(tb).get();
         if bucket_fb.key(fs) != &(*from).key ||
            bucket_tb.occupied(ts) ||
            !bucket_fb.occupied(fs) {
@@ -1763,7 +1744,7 @@ unsafe fn try_read_from_bucket<K, V, P>
         K: Copy + Eq,
         V: Copy,
 {
-    let bucket = (*ti).buckets.get_unchecked(i);
+    let bucket = &*(*ti).buckets.get_unchecked(i).get();
     for j in Range::new(0, SLOT_PER_BUCKET) {
         if !bucket.occupied(j) {
             continue;
@@ -1789,7 +1770,7 @@ unsafe fn check_in_bucket<K, V, P>
                           key: &K, i: usize) -> bool where
         K: Copy + Eq,
 {
-    let bucket = (*ti).buckets.get_unchecked(i);
+    let bucket = &*(*ti).buckets.get_unchecked(i).get();
     for j in Range::new(0, SLOT_PER_BUCKET) {
         if !bucket.occupied(j) {
             continue;
@@ -1818,7 +1799,7 @@ unsafe fn add_to_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
         /*K: fmt::Debug,*/
         /*V: fmt::Debug,*/
 {
-    let bucket = (*ti).buckets.get_unchecked_mut(i);
+    let bucket = &mut *(*ti).buckets.get_unchecked_mut(i).get();
     //debug_assert!(!bucket.occupied(j));
     // For now, we know we are "simple" so we skip this part.
     //if (!is_simple) {
@@ -1845,7 +1826,7 @@ unsafe fn try_find_insert_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
         K: Copy + Eq,
 {
     let mut found_empty = Err(TableFull);
-    let bucket = (*ti).buckets.get_unchecked(i);
+    let bucket = &*(*ti).buckets.get_unchecked(i).get();
     for k in Range::new(0, SLOT_PER_BUCKET) {
         if bucket.occupied(k) {
             // For now, we know we are "simple" so we skip this part.
@@ -1875,7 +1856,7 @@ unsafe fn try_del_from_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
         K: Eq,
 {
     // Safe because we have the lock.
-    let bucket = (*ti).buckets.get_unchecked_mut(i);
+    let bucket = &mut *(*ti).buckets.get_unchecked_mut(i).get();
     for j in Range::new(0, SLOT_PER_BUCKET) {
         if !bucket.occupied(j) {
             continue;
@@ -1907,7 +1888,7 @@ unsafe fn try_update_bucket<K, V, P>(ti: *mut TableInfo<K, V>, _partial: P,
         V: Copy,
 {
     // Safe because we have the lock.
-    let bucket = (*ti).buckets.get_unchecked_mut(i);
+    let bucket = &mut *(*ti).buckets.get_unchecked_mut(i).get();
     for j in Range::new(0, SLOT_PER_BUCKET) {
         if !bucket.occupied(j) {
             continue;
@@ -1935,7 +1916,7 @@ unsafe fn try_update_bucket_fn<K, V, P, F, T>(ti: *mut TableInfo<K, V>, _partial
         F: FnMut(&mut V) -> T,
 {
     // Safe because we have the lock.
-    let bucket = (*ti).buckets.get_unchecked_mut(i);
+    let bucket = &mut *(*ti).buckets.get_unchecked_mut(i).get();
     for j in Range::new(0, SLOT_PER_BUCKET) {
         if !bucket.occupied(j) {
             continue;
@@ -1958,16 +1939,14 @@ unsafe fn try_update_bucket_fn<K, V, P, F, T>(ti: *mut TableInfo<K, V>, _partial
 ///
 /// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be
 /// set, and i1 and i2 to be in bounds.
-unsafe fn cuckoo_find<K, V>(key: &K,
-                            _hv: usize, ti: *const TableInfo<K, V>,
-                            i1: usize, i2: usize) -> Option<V> where
+unsafe fn cuckoo_find<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -> Option<V> where
         K: Copy + Eq,
         V: Copy,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    try_read_from_bucket(ti, partial, key, i1)
-        .or_else( || try_read_from_bucket(ti, partial, key, i2))
+    try_read_from_bucket(snapshot.ti, partial, key, snapshot.i1)
+        .or_else( || try_read_from_bucket(snapshot.ti, partial, key, snapshot.i2))
 }
 
 /// cuckoo_contains searches the table for the given key, returning true if
@@ -1976,15 +1955,13 @@ unsafe fn cuckoo_find<K, V>(key: &K,
 ///
 /// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be
 /// set, and i1 and i2 to be in bounds.
-unsafe fn cuckoo_contains<K, V>(key: &K,
-                                _hv: usize, ti: *const TableInfo<K, V>,
-                                i1: usize, i2: usize) -> bool
-    where K: Copy + Eq,
+unsafe fn cuckoo_contains<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -> bool where
+        K: Copy + Eq,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    check_in_bucket(ti, partial, key, i1)
-        || check_in_bucket(ti, partial, key, i2)
+    check_in_bucket(snapshot.ti, partial, key, snapshot.i1)
+        || check_in_bucket(snapshot.ti, partial, key, snapshot.i2)
 }
 
 /// cuckoo_delete searches the table for the given key and sets the slot with
@@ -1994,15 +1971,14 @@ unsafe fn cuckoo_contains<K, V>(key: &K,
 /// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be set,
 /// and i1 and i2 to be in bounds.
 unsafe fn cuckoo_delete<K, V>(key: &K,
-                              _hv: usize, ti: *mut TableInfo<K, V>,
-                              i1: usize, i2: usize) -> Option<V> where
+                              _hv: usize, snapshot: &LockTwo<K, V>) -> Option<V> where
         K: Eq,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    match try_del_from_bucket(ti, partial, key, i1) {
+    match try_del_from_bucket(snapshot.ti, partial, key, snapshot.i1) {
         v @ Some(_) => v,
-        None => try_del_from_bucket(ti, partial, key, i2)
+        None => try_del_from_bucket(snapshot.ti, partial, key, snapshot.i2)
     }
 }
 
@@ -2013,16 +1989,15 @@ unsafe fn cuckoo_delete<K, V>(key: &K,
 /// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be set,
 /// and i1 and i2 to be in bounds.
 unsafe fn cuckoo_update<K,V>(key: &K, val: V,
-                             _hv: usize, ti: *mut TableInfo<K, V>,
-                             i1: usize, i2: usize) -> Result<V, V> where
+                             _hv: usize, snapshot: &LockTwo<K, V>) -> Result<V, V> where
         K: Eq,
         V: Copy,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    match try_update_bucket(ti, partial, key, val, i1) {
+    match try_update_bucket(snapshot.ti, partial, key, val, snapshot.i1) {
         v @ Ok(_) => v,
-        Err(val) => try_update_bucket(ti, partial, key, val, i2)
+        Err(val) => try_update_bucket(snapshot.ti, partial, key, val, snapshot.i2)
     }
 }
 
@@ -2034,16 +2009,15 @@ unsafe fn cuckoo_update<K,V>(key: &K, val: V,
 /// Unsafe because it expects the locks to be taken, ti to be valid, the hazard pointer to be set,
 /// and i1 and i2 to be in bounds.
 unsafe fn cuckoo_update_fn<K, V, F, T>(key: &K, updater: &mut F,
-                                       _hv: usize, ti: *mut TableInfo<K, V>,
-                                       i1: usize, i2: usize) -> Option<T> where
+                                       _hv: usize, snapshot: &LockTwo<K, V>) -> Option<T> where
         K: Eq,
         F: FnMut(&mut V) -> T,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    match try_update_bucket_fn(ti, partial, key, updater, i1) {
+    match try_update_bucket_fn(snapshot.ti, partial, key, updater, snapshot.i1) {
         v @ Some(_) => v,
-        None => try_update_bucket_fn(ti, partial, key, updater, i2)
+        None => try_update_bucket_fn(snapshot.ti, partial, key, updater, snapshot.i2)
     }
 }
 
