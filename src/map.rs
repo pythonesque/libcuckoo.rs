@@ -6,7 +6,6 @@ use std::cell::UnsafeCell;
 use std::collections::hash_state::{DefaultState, HashState};
 //use std::fmt;
 use std::hash::{Hash, Hasher, SipHasher};
-use std::i32;
 use std::intrinsics;
 use std::mem;
 use std::ptr;
@@ -20,9 +19,6 @@ use super::sys::arch::cpuid;
 /// SLOT_PER_BUCKET is the maximum number of keys per bucket
 const SLOT_PER_BUCKET: usize = 4;
 
-#[static_assert]
-static _SLOT_PER_BUCKET_NONZERO: bool = SLOT_PER_BUCKET != 0;
-
 /// DEFAULT_SIZE is the default number of elements in an empty hash
 /// table
 const DEFAULT_SIZE: usize = (1 << 16) * SLOT_PER_BUCKET;
@@ -32,12 +28,10 @@ const DEFAULT_SIZE: usize = (1 << 16) * SLOT_PER_BUCKET;
 /// number of locks in the locks_ array
 const K_NUM_LOCKS: usize = 1 << 16;
 
-#[static_assert]
-static _K_NUM_LOCKS_NONZERO: bool = K_NUM_LOCKS != 0;
-
+/*
 /// true if the key is small and simple, which means using partial keys would
 /// probably slow us down
-/*static const bool is_simple =
+static const bool is_simple =
     std::is_pod<key_type>::value && sizeof(key_type) <= 8;
 
 static const bool value_copy_assignable = std::is_copy_assignable<
@@ -323,6 +317,9 @@ fn reserve_calc(n: usize) -> usize {
     new_hashpower
 }
 
+/// In my current benchmarks, inserts with (num_cpus) threads all working at once, even when most
+/// of them already exist, are about 80% faster than the speed of normal HashMap inserts with
+/// FnvHashMap with identical workloads, initial capacities, algorithm implementations, etc.).
 pub struct CuckooHashMap<K, V, S = DefaultState<SipHasher>> {
     table_info: AtomicPtr<TableInfo<K, V>>,
 
@@ -1528,20 +1525,6 @@ impl BSlot {
     }
 }
 
-/*static_assert(const_pow(SLOT_PER_BUCKET, MAX_BFS_PATH_LEN) <
-              std::numeric_limits<decltype(pathcode)>::max(),
-              "pathcode may not be large enough to encode a cuckoo"
-              " path");*/
-
-#[static_assert]
-/// The depth type must able to hold a value of
-/// MAX_BFS_PATH_LEN - 1");
-static MAX_BFS_PATH_FITS_IN_DEPTH: bool = (MAX_BFS_PATH_LEN - 1) as Depth <= i32::MAX;
-
-#[static_assert]
-/// The depth type must be able to hold a value of -1
-static NEGATIVE_ONE_FITS_IN_DEPTH: bool = -1 as Depth >= i32::MIN;
-
 /// b_queue is the queue used to store b_slots for BFS cuckoo hashing.
 #[repr(packed)]
 struct BQueue {
@@ -1558,14 +1541,6 @@ struct BQueue {
 /// it's a power of 2, then we can quickly wrap around to the beginning
 /// of the array, so we do that.
 const MAX_CUCKOO_COUNT: usize = 512;
-
-/*static_assert(const_pow(SLOT_PER_BUCKET, MAX_BFS_PATH_LEN) >=
-              MAX_CUCKOO_COUNT, "MAX_CUCKOO_COUNT value is too large"
-              " to be useful");*/
-
-#[static_assert]
-/// MAX_CUCKOO_COUNT should be a power of 2
-static MAX_CUCKOO_COUNT_POWER_OF_2: bool = (MAX_CUCKOO_COUNT & (MAX_CUCKOO_COUNT - 1)) == 0;
 
 /// returns the index in the queue after ind, wrapping around if
 /// necessary.
@@ -1586,14 +1561,14 @@ impl BQueue{
         }
     }
 
-    /// unsafe because it assumes that the queue is not full.
+    /// Unsafe because it assumes that the queue is not full.
     unsafe fn enqueue(&mut self, x: BSlot) {
         // debug_assert!(!self.full());
         *self.slots.get_unchecked_mut(self.last) = x;
         self.last = increment(self.last);
     }
 
-    /// unsafe because it assumes the queue is nonempty.
+    /// Unsafe because it assumes the queue is nonempty.
     unsafe fn dequeue(&mut self, ) -> BSlot {
         // debug_assert!(!self.empty());
         let x = *self.slots.get_unchecked(self.first);
@@ -2005,10 +1980,108 @@ fn cuckoo_loadfactor<K, V>(ti: &TableInfo<K, V>) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    extern crate test;
+
+    use num_cpus;
+    use std::collections::hash_state::DefaultState;
+    use std::i32;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use super::{Depth, K_NUM_LOCKS, MAX_BFS_PATH_LEN, MAX_CUCKOO_COUNT, SLOT_PER_BUCKET};
     use super::CuckooHashMap;
+    use super::super::iter::Range;
+    use super::super::nodemap::FnvHasher;
+
+    #[test]
+    fn slot_per_bucket_nonzero() {
+        assert!(SLOT_PER_BUCKET != 0);
+    }
+
+    #[test]
+    fn k_num_locks_nonzero() {
+        assert!(K_NUM_LOCKS != 0);
+    }
+
+    /*static_assert(const_pow(SLOT_PER_BUCKET, MAX_BFS_PATH_LEN) <
+                  std::numeric_limits<decltype(pathcode)>::max(),
+                  "pathcode may not be large enough to encode a cuckoo"
+                  " path");*/
+
+    #[test]
+    /// The depth type must able to hold a value of
+    /// MAX_BFS_PATH_LEN - 1");
+    fn max_bfs_path_fits_in_depth() {
+        assert!((MAX_BFS_PATH_LEN - 1) as Depth <= i32::MAX);
+    }
+
+    /// The depth type must be able to hold a value of -1
+    #[test]
+    fn negative_one_fits_in_depth() {
+        assert!(-1 as Depth >= i32::MIN);
+    }
+
+    /*static_assert(const_pow(SLOT_PER_BUCKET, MAX_BFS_PATH_LEN) >=
+                  MAX_CUCKOO_COUNT, "MAX_CUCKOO_COUNT value is too large"
+                  " to be useful");*/
+
+    /// MAX_CUCKOO_COUNT should be a power of 2
+    #[test]
+    fn max_cuckoo_count_power_of_two() {
+        assert!((MAX_CUCKOO_COUNT & (MAX_CUCKOO_COUNT - 1)) == 0);
+    }
 
     #[test]
     fn make_hashmap() {
-        let foo = CuckooHashMap::<u64, u64>::default();
+        CuckooHashMap::<u64, u64>::default();
+    }
+
+    #[bench]
+    fn bench_single_threaded_hashmap(b: &mut test::Bencher) {
+        const MAX: u32 = 325_000;
+        const SIZE: usize = 1 << 21;
+        use std::collections::HashMap;
+        // 34ns is the time to beat (i.e. the time the cuckoo hash map seems to take in a real
+        // benchmark, on average)
+        let state = DefaultState::<FnvHasher>::default();
+        let mut map = HashMap::with_capacity_and_hash_state(SIZE, state);
+        let num_cpus = num_cpus::get() as u32;
+        b.iter( || {
+            for i in Range::new(0, num_cpus * MAX) {
+                map.insert(i, ());
+            }
+        });
+    }
+
+    #[bench]
+    fn bench_cuckoo_hashmap(b: &mut test::Bencher) {
+        const MAX: u32 = 325_000;
+        const SIZE: usize = 1 << 21;
+        let state = DefaultState::<FnvHasher>::default();
+        let ref map = CuckooHashMap::with_capacity_and_hash_state(SIZE, state);
+        let num_cpus = num_cpus::get() as u32;
+        let ref done = AtomicBool::new(false);
+        let ref barrier = Barrier::new(num_cpus as usize + 1);
+        let mut threads = Vec::with_capacity(num_cpus as usize);
+        for i in Range::new(0, num_cpus) {
+            threads.push(thread::scoped( move || {
+                loop {
+                    barrier.wait();
+                    if done.load(Ordering::SeqCst) { break }
+                    for i in Range::new(i * MAX, i.checked_add(1).unwrap() * MAX) {
+                        let _ = map.upsert(i, |_| (), ());
+                    }
+                    barrier.wait();
+                }
+            }));
+        }
+        b.iter( move || {
+            // Test start
+            barrier.wait();
+            // Test end
+            barrier.wait();
+        });
+        done.store(true, Ordering::SeqCst);
+        barrier.wait();
     }
 }

@@ -37,6 +37,8 @@ pub struct SpinLock {
     padding: [SpinLockAlign; 0],
 }
 
+unsafe impl Sync for SpinLock {}
+
 const DEFAULT_SPINS_PER_DELAY: u32 = 100;
 #[thread_local] static mut SPINS_PER_DELAY: u32 = DEFAULT_SPINS_PER_DELAY;
 
@@ -83,7 +85,7 @@ impl SpinLock {
         self.tas()
     }
 
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         SpinLock { lock: UnsafeCell::new(0), padding: [] }
     }
 

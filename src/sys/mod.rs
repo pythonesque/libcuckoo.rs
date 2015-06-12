@@ -7,6 +7,14 @@ use rand::{Rand, Rng, SeedableRng};
 #[cfg(unix)]
 #[path = "unix.rs"] pub mod os;
 
+/**
+ * Returns the current value of a high-resolution performance counter
+ * in nanoseconds since an unspecified epoch.
+ */
+pub fn precise_time_ns() -> u64 {
+    return os::precise_time_ns();
+}
+
 // Copyright 2014 The Rust Project Developers. See the COPYRIGHT
 // file at the top-level directory of this distribution and at
 // http://rust-lang.org/COPYRIGHT.

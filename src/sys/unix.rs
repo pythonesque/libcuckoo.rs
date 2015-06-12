@@ -3,6 +3,97 @@ use core::intrinsics;
 use libc::{self, c_int};
 use super::Duration;
 
+#[cfg(all(not(target_os = "macos"), not(target_os = "ios")))]
+mod imp {
+    use libc::{c_int, timespec};
+
+    // Apparently android provides this in some other library?
+    #[cfg(all(not(target_os = "android"),
+              not(target_os = "nacl")))]
+    #[link(name = "rt")]
+    extern {}
+
+    extern {
+        pub fn clock_gettime(clk_id: c_int, tp: *mut timespec) -> c_int;
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod imp {
+    use core::atomic::{AtomicBool, Ordering};
+    use core::intrinsics;
+    use libc::{timeval, timezone, c_int, mach_timebase_info};
+    use super::super::super::spinlock::SpinLock;
+
+    extern {
+        pub fn gettimeofday(tp: *mut timeval, tzp: *mut timezone) -> c_int;
+        pub fn mach_absolute_time() -> u64;
+        pub fn mach_timebase_info(info: *mut mach_timebase_info) -> c_int;
+    }
+
+    /// After this is called, the return mach_timebase_info is guaranteed to have a nonzero
+    /// denominator.
+    pub fn info() -> &'static mach_timebase_info {
+        static mut INFO: mach_timebase_info = mach_timebase_info {
+            numer: 0,
+            denom: 0,
+        };
+        static ONCE: AtomicBool = AtomicBool::new(false);
+
+        #[cold]
+        /// After this is called, the return mach_timebase_info is guaranteed to have a nonzero
+        /// denominator.
+        fn init() {
+            static LOCK: SpinLock = SpinLock::new();
+            unsafe {
+                LOCK.lock();
+                if !ONCE.load(Ordering::Relaxed) {
+                    mach_timebase_info(&mut INFO);
+                    if INFO.denom == 0 { intrinsics::abort(); }
+                    ONCE.store(true, Ordering::Relaxed);
+                }
+                LOCK.unlock();
+            }
+        }
+        unsafe {
+            if !ONCE.load(Ordering::Relaxed) {
+                init();
+            }
+            &INFO
+        }
+    }
+}
+
+/**
+ * Returns the current value of a high-resolution performance counter
+ * in nanoseconds since an unspecified epoch.
+ */
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn precise_time_ns() -> u64 {
+    unsafe {
+        let time = imp::mach_absolute_time();
+        let info = imp::info();
+        intrinsics::unchecked_udiv(time.wrapping_mul(info.numer as u64), info.denom as u64)
+    }
+}
+
+/*struct Timer {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn new() -> Self {
+
+        if info.denom == 0 { intrinsics::abort(); }
+    }
+}*/
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn precise_time_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        imp::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    return (ts.tv_sec as u64) * 1000000000 + (ts.tv_nsec as u64)
+}
+
 /// Returns the platform-specific value of errno
 pub fn errno() -> i32 {
     #[cfg(any(target_os = "macos",

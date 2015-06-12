@@ -1,5 +1,5 @@
 //#![no_start]
-#![feature(asm,associated_consts,box_syntax,lang_items,libc,start,std_misc,thread_local,no_std,core,unsafe_no_drop_flag,static_assert,/*rustc_private,*/zero_one,step_trait,optin_builtin_traits,scoped,simd)]
+#![feature(asm,associated_consts,box_syntax,lang_items,libc,start,std_misc,thread_local,no_std,core,unsafe_no_drop_flag,/*rustc_private,*/zero_one,step_trait,optin_builtin_traits,scoped,simd)]
 #![feature(const_fn)]
 #![cfg_attr(test, feature(test))]
 #![allow(dead_code)]
@@ -47,10 +47,6 @@ mod sys;
 #[cfg(test)]
 mod tests {
     extern crate test;
-
-    use self::test::Bencher;
-
-    use super::CuckooHashMap;
 
     #[test]
     fn test_map() {
@@ -133,6 +129,11 @@ fn main() {
             let Stats { upsert, delete, insert, update, read } = self;
             Stats { upsert: f(upsert), delete: f(delete), insert: f(insert), update: f(update), read: f(read) }
         }
+        fn dot<B, F, T>(self, s: Stats<T>, f: F) -> Stats<B> where F: Fn(S, T) -> B {
+            let Stats { upsert: u1, delete: d1, insert: i1, update: p1, read: r1 } = self;
+            let Stats { upsert: u2, delete: d2, insert: i2, update: p2, read: r2 } = s;
+            Stats { upsert: f(u1, u2), delete: f(d1, d2), insert: f(i1, i2), update: f(p1, p2), read: f(r1, r2) }
+        }
         const fn new(init: S) -> Self {
             Stats { upsert: init, delete: init, insert: init, update: init, read: init }
         }
@@ -164,82 +165,88 @@ fn main() {
                  ((total_per_entry - ops_per_entry.read) as f64 / (total_per_entry as f64) * 100.0).round());
     }
     let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::with_capacity_and_hash_state(CAPACITY, Default::default());
-    let upsert = |j: Key| {
+    let upsert = |j: Key, stats: &mut Stats<Key>| {
         let range = /*if SLICE_THREADS == CORES {
             Range::new(th, th + 1)
         } else {
             */Range::new(0, NUM_THREADS)/*
         }*/;
-        //let mut inserts: Key = 0;
-        //let mut updates = 0;
+        let mut upserts: Key = 0;
+        let mut reads: Key = 0;
         /*'here: */for j in range {
             for i in Range::new(j * MAX, (j + 1) * MAX) {
+                upserts = upserts.wrapping_add(1);
                 if let None = map.upsert(i, |b| { *b = RED; }, BLACK) {
-                    //inserts += 1;
                     continue;
-                } else {
-                    //updates += 1;
                 }
                 if map.find(&i) != Some(RED) {
                     //println!("upsert error");
                     unsafe { intrinsics::abort(); }
                     //break 'here;
                 }
-                //upserts += 1;
+                reads = reads.wrapping_add(1);
             }
         }
+        stats.upsert = stats.upsert.wrapping_add(upserts);
+        stats.read = stats.read.wrapping_add(reads);
         println!("({}) upserts", j);//, upserts);
         //Stats { upsert: inserts.wrapping_add(updates), read: updates, .. Stats::new(0) }
         //println!("({}) {} upserts ({} inserts, {} updates, {} finds)", j, inserts.wrapping_add(updates), inserts, updates, updates);
     };
-    let delete = |j: Key| {
-        //let mut deletes = 0;
+    let delete = |j: Key, stats: &mut Stats<Key>| {
+        let mut deletes: Key = 0;
+        let mut reads: Key = 0;
         for i in Range::new(j * MAX, (j + 1) * MAX) {
             if let None = map.erase(&i) {
                 //println!("delete error");
                 unsafe { intrinsics::abort(); }
                 //break;
             }
+            deletes = deletes.wrapping_add(1);
             if let Some(_) = map.find(&i) {
                 //println!("find after delete error");
                 unsafe { intrinsics::abort(); }
                 //break;
             }
-            //deletes += 1;
+            reads = reads.wrapping_add(1);
         }
+        stats.delete = stats.delete.wrapping_add(deletes);
+        stats.read = stats.read.wrapping_add(reads);
         println!("({}) deletes", j);//, writes);
     };
-    let insert = |j: Key| {
-        //let mut writes = 0;
+    let insert = |j: Key, stats: &mut Stats<Key>| {
+        let mut inserts: Key = 0;
         for i in Range::new(j * MAX, (j + 1) * MAX) {
             if let Err(_) = map.insert(i, BLACK) {
                 //println!("insert error");
                 unsafe { intrinsics::abort(); }
                 //break;
             }
-            //writes += 1;
+            inserts = inserts.wrapping_add(1);
         }
+        stats.insert = stats.insert.wrapping_add(inserts);
         println!("({}) writes", j);//, writes);
     };
-    let update = |j: Key| {
-        //let mut update = 0;
+    let update = |j: Key, stats: &mut Stats<Key>| {
+        let mut updates: Key = 0;
         for i in Range::new(j * MAX, (j + 1) * MAX) {
             if map.update(&i, RED) != Ok(BLACK) {
                 //println!("update error");
                 unsafe { intrinsics::abort(); }
                 //break;
             }
-            //updates += 1;
+            updates = updates.wrapping_add(1);
         }
+        stats.update = stats.update.wrapping_add(updates);
         println!("({}) updates", j);//, updates);
     };
-    let find = |th: Key| {
+    let find = |th: Key, stats: &mut Stats<Key>| {
         let range = if SLICE_THREADS == CORES {
             Range::new(th, th + 1)
         } else {
             Range::new(0, NUM_THREADS)
         };
-        //let mut reads = 0;
+        let mut reads = 0;
         /*'here: */for j in range {
             for _ in Range::new(0, NUM_READS) {
                 for i in Range::new(j * MAX, (j + 1) * MAX) {
@@ -248,49 +255,64 @@ fn main() {
                         unsafe { intrinsics::abort(); }
                         //break 'here;
                     }
-                    //reads += 1;
+                    reads += 1;
                 }
             }
         }
+        stats.read = stats.read.wrapping_add(reads);
         println!("({}) reads", th,);// reads);
     };
 
-    unsafe fn make_threads<'a, F, T>(f: &'a F) -> [thread::JoinGuard<'a, T>; NUM_THREADS as usize] where
-            F: Fn(Key) -> T + Send + Sync + 'a,
-            T: Send
+    unsafe fn make_threads<'a, F, T>(f: &'a F, s: &'a mut [T ; NUM_THREADS as usize])
+                                     -> [thread::JoinGuard<'a, ()>; NUM_THREADS as usize] where
+            F: Fn(Key, &'a mut T) + Send + Sync + 'a,
+            T: Send,
     {
-        let mut t: [thread::JoinGuard<T> ; NUM_THREADS as usize] = mem::uninitialized();
+        let mut t: [thread::JoinGuard<()> ; NUM_THREADS as usize] = mem::uninitialized();
         for j in Range::new(0, NUM_THREADS) {
-            ptr::write(t.as_mut_ptr().offset(j as isize), thread::scoped(move || f(j)));
+            let stats = &mut *s.as_mut_ptr().offset(j as isize);
+            ptr::write(t.as_mut_ptr().offset(j as isize), thread::scoped(move || {
+                //let start = sys::precise_time_ns();
+                f(j, stats);
+                //let end = sys::precise_time_ns();
+                //println!("({}) {} ns", j, end - start);
+            }));
         }
         t
     }
+    let mut stats = [Stats::new(0) ; NUM_THREADS as usize];
     unsafe {
         {
-            make_threads(&upsert);
+            make_threads(&upsert, &mut stats);
         }
         if SLICE_THREADS == CORES {
-            let all = |th| {
-                delete(th);
-                insert(th);
-                update(th);
-                find(th);
+            let all = |th, stats: &mut Stats<Key>| {
+                delete(th, stats);
+                insert(th, stats);
+                update(th, stats);
+                find(th, stats);
             };
-            make_threads(&all);
+            make_threads(&all, &mut stats);
         } else {
             {
-                make_threads(&delete);
+                make_threads(&delete, &mut stats);
             }
             {
-                make_threads(&insert);
+                make_threads(&insert, &mut stats);
             }
             {
-                make_threads(&update);
+                make_threads(&update, &mut stats);
             }
             {
-                make_threads(&find);
+                make_threads(&find, &mut stats);
             }
         }
+    }
+    {
+        let Stats { upsert, delete, insert, update, read } =
+            stats.iter().fold(Stats::new(0), |res, &s| res.dot(s, |x: Key, y: Key| x.wrapping_add(y) ) );
+        println!("upserts: {}, deletes: {}, inserts: {}, updates: {}, reads: {}",
+                 upsert, delete, insert, update, read);
     }
 
     /*
