@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use super::iter::Range;
 use super::hazard_pointer::{check_hazard_pointer, delete_unused, HazardPointer, HazardPointerSet};
 use super::spinlock::SpinLock;
+#[cfg(feature = "counter")]
 use super::sys::arch::cpuid;
 
 /// SLOT_PER_BUCKET is the maximum number of keys per bucket
@@ -289,13 +290,15 @@ struct Counter(UnsafeCell<Option<usize>>);
 unsafe impl Sync for Counter {}
 
 /// counterid stores the per-thread counter index of each thread.
-#[thread_local] static COUNTER_ID: Counter = Counter(UnsafeCell { value: None });
+#[cfg(feature = "counter")]
+#[thread_local] static COUNTER_ID: Counter = Counter(UnsafeCell::new(None));
 
 /// check_counterid checks if the counterid has already been determined. If
 /// not, it assigns a counterid to the current thread by picking a random
 /// core. This should be called at the beginning of any function that changes
 /// the number of elements in the table.
 #[inline(always)]
+#[cfg(feature = "counter")]
 fn check_counterid() {
     unsafe {
         let counterid = COUNTER_ID.0.get();
@@ -304,6 +307,8 @@ fn check_counterid() {
         };
     }
 }
+#[cfg(not(feature = "counter"))]
+fn check_counterid() {}
 
 /// reserve_calc takes in a parameter specifying a certain number of slots
 /// for a table and returns the smallest hashpower that will hold n elements.
@@ -366,12 +371,14 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             for bucket in &mut (*ti.as_raw()).buckets {
                 (*bucket.get()).clear();
             }
-            let mut insert = ti.num_inserts.iter();
-            let mut delete = ti.num_deletes.iter();
-            while let Some(insert) = insert.next() {
-                let delete = delete.next().unwrap_or_else(|| intrinsics::unreachable());
-                insert.store_notatomic(0);
-                delete.store_notatomic(0);
+            if cfg!(feature = "counter") {
+                let mut insert = ti.num_inserts.iter();
+                let mut delete = ti.num_deletes.iter();
+                while let Some(insert) = insert.next() {
+                    let delete = delete.next().unwrap_or_else(|| intrinsics::unreachable());
+                    insert.store_notatomic(0);
+                    delete.store_notatomic(0);
+                }
             }
         }
     }
@@ -379,6 +386,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// size returns the number of items currently in the hash table. Since it
     /// doesn't lock the table, elements can be inserted during the computation,
     /// so the result may not necessarily be exact (it may even be negative).
+    #[cfg(feature = "counter")]
     pub fn size(&self) -> isize {
         let hazard_pointer = check_hazard_pointer();
         let ti = self.snapshot_table_nolock(&hazard_pointer);
@@ -386,6 +394,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     }
 
     /// empty returns true if the table is empty.
+    #[cfg(feature = "counter")]
     pub fn empty(&self) -> bool {
         self.size() == 0
     }
@@ -406,6 +415,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// load_factor returns the ratio of the number of items in the table to the
     /// total number of available slots in the table.
     /// The result may not necessarily be exact (it may even be negative).
+    #[cfg(feature = "counter")]
     pub fn load_factor(&self) -> f64 {
         let hazard_pointer = check_hazard_pointer();
         let ti = self.snapshot_table_nolock(&hazard_pointer);
@@ -918,6 +928,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// function.
     ///
     /// Unsafe because it expects the locks to be taken and i1 and i2 to be in bounds.
+    /// With counter enabled, also assumes that the counter has been checked and is in bounds.
     unsafe fn cuckoo_insert(&self,
                             key: K, val: V,
                             hv: usize, snapshot: LockTwo<K, V>) -> InsertResult<(), K, V> where
@@ -990,6 +1001,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// directly after snapshot_and_lock_two.
     ///
     /// Unsafe because it expects the locks to be taken and i1 and i2 to be in bounds.
+    /// With counter enabled, also assumes that the counter has been checked and is in bounds.
     unsafe fn cuckoo_insert_loop<'a>(&self, hazard_pointer: &'a HazardPointer,
                                      mut key: K, mut val: V,
                                      hv: usize,
@@ -1734,6 +1746,7 @@ unsafe fn check_in_bucket<K, V, P>
 /// add_to_bucket will insert the given key-value pair into the slot.
 ///
 /// Unsafe because it assumes i and j are in bounds, i is locked, and j is not occupied.
+/// With counter enabled, also assumes that the counter has been checked and is in bounds.
 unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
                                  key: K, val: V,
                                  i: usize, j: usize) where
@@ -1749,9 +1762,17 @@ unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
     //}
     // &mut should be safe; this function is potected by the lock.
     bucket.set_kv(j, key, val);
-    let counterid = (*COUNTER_ID.0.get()).unwrap_or_else( || intrinsics::unreachable() );
-    let num_inserts = ti.num_inserts.get_unchecked(counterid);
-    num_inserts.fetch_add_relaxed(1);
+    #[inline(always)]
+    #[cfg(feature = "counter")]
+    /// Unsafe because it assumes the counter has been checked and is in bounds.
+    unsafe fn insert_counter<K, V>(ti: &TableInfo<K, V>) {
+        let counterid = (*COUNTER_ID.0.get()).unwrap_or_else( || intrinsics::unreachable() );
+        let num_inserts = ti.num_inserts.get_unchecked(counterid);
+        num_inserts.fetch_add_relaxed(1);
+    }
+    #[cfg(not(feature = "counter"))]
+    fn insert_counter<K, V>(_: &TableInfo<K, V>) {}
+    insert_counter(ti);
 }
 
 /// try_find_insert_bucket will search the bucket and store the index of an
@@ -1789,6 +1810,7 @@ unsafe fn try_find_insert_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
 /// slot of the key to empty if it finds it.
 ///
 /// Unsafe because it assumes i is in bounds and locked.
+/// With counter enabled, also assumes that the counter has been checked and is in bounds.
 unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
                                        key: &K,
                                        i: usize)
@@ -1805,11 +1827,19 @@ unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
         // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
         //     continue;
         // }
-        if bucket.key(j) == key {
-            let (_, v) = bucket.erase_kv(j);
+        #[inline(always)]
+        #[cfg(feature = "counter")]
+        /// Unsafe because it assumes the counter has been checked and is in bounds.
+        unsafe fn delete_counter<K, V>(ti: &TableInfo<K, V>) {
             let counterid = (*COUNTER_ID.0.get()).unwrap_or_else( || intrinsics::unreachable() );
             let num_deletes = ti.num_deletes.get_unchecked(counterid);
             num_deletes.fetch_add_relaxed(1);
+        }
+        #[cfg(not(feature = "counter"))]
+        fn delete_counter<K, V>(_: &TableInfo<K, V>) {}
+        if bucket.key(j) == key {
+            let (_, v) = bucket.erase_kv(j);
+            delete_counter(ti);
             return Some(v);
         }
     }
@@ -1905,6 +1935,7 @@ unsafe fn cuckoo_contains<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -
 /// released outside the function.
 ///
 /// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
+/// With counter enabled, also assumes that the counter has been checked and is in bounds.
 unsafe fn cuckoo_delete<K, V>(key: &K,
                               _hv: usize, snapshot: &LockTwo<K, V>) -> Option<V> where
         K: Eq,
@@ -1956,6 +1987,7 @@ unsafe fn cuckoo_update_fn<K, V, F, T>(key: &K, updater: &mut F,
 
 /// cuckoo_size returns the number of elements in the given table.
 /// The number of elements is approximate and may be negative.
+#[cfg(feature = "counter")]
 fn cuckoo_size<K, V>(ti: &TableInfo<K, V>) -> isize {
     let mut inserts = 0usize;
     let mut deletes = 0usize;
@@ -1974,6 +2006,7 @@ fn cuckoo_size<K, V>(ti: &TableInfo<K, V>) -> isize {
 
 /// cuckoo_loadfactor returns the load factor of the given table.
 /// The load factor is approximate and may be negative.
+#[cfg(feature = "counter")]
 fn cuckoo_loadfactor<K, V>(ti: &TableInfo<K, V>) -> f64 {
     cuckoo_size(ti) as f64 / SLOT_PER_BUCKET as f64 / hashsize(ti.hashpower) as f64
 }

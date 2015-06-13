@@ -108,12 +108,12 @@ fn main() {
     const BLACK: Val = true;//[[!0 ; 8]; 16];//();
     //const MAX: Key = 0x20add; // no cuckoo (133853)
     //const MAX: Key = 0x3df36; // no resize (253750) 4 * 4 * 4 * 253750
-    const MAX: Key = 650_000;
+    const MAX: Key = 650_000;//324992;//288881
     //const MAX: Key = 1_000_000;
     //const MAX: Key = 20 * 3000;
-    const CORES: Key = 4;
+    const CORES: Key = 4;//8;
     const SLICE_THREADS: Key = CORES; // 1
-    const NUM_THREADS: Key = 4;
+    const NUM_THREADS: Key = 4;//8;
     const LOAD_FACTOR: Key = 1;//6;
     const NUM_READS: Key = LOAD_FACTOR * ((CORES + NUM_THREADS - 1) / NUM_THREADS) * ((CORES + NUM_THREADS - 1) / NUM_THREADS)* SLICE_THREADS;// * 4;//60; // 48 * 4 * 4 * 20 * 3000
 
