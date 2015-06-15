@@ -431,9 +431,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
-            let st = cuckoo_find(key, hv, &snapshot);
+            let st = cuckoo_find(key, hv, &mut snapshot);
             snapshot.release();
             st
         }
@@ -447,9 +447,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
-            let result = cuckoo_contains(key, hv, &snapshot);
+            let result = cuckoo_contains(key, hv, &mut snapshot);
             snapshot.release();
             result
         }
@@ -483,9 +483,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         check_counterid();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
-            let result = cuckoo_delete(key, hv, &snapshot);
+            let result = cuckoo_delete(key, hv, &mut snapshot);
             snapshot.release();
             result
         }
@@ -499,9 +499,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
-            let result = cuckoo_update(key, val, hv, &snapshot);
+            let result = cuckoo_update(key, val, hv, &mut snapshot);
             snapshot.release();
             result
         }
@@ -518,9 +518,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         unsafe {
-            let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
+            let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
 
-            let result = cuckoo_update_fn(key, &mut updater, hv, &snapshot);
+            let result = cuckoo_update_fn(key, &mut updater, hv, &mut snapshot);
             snapshot.release();
             result
         }
@@ -542,8 +542,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hv = hashed_key(&self.hash_state, &key);
         unsafe {
             loop {
-                let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
-                match cuckoo_update_fn(&key, &mut updater, hv, &snapshot) {
+                let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
+                match cuckoo_update_fn(&key, &mut updater, hv, &mut snapshot) {
                     v @ Some(_) => {
                         snapshot.release();
                         return v;
@@ -863,7 +863,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
     unsafe fn run_cuckoo(&self,
                          ti: &TableInfo<K, V>, i1: usize, i2: usize)
-                         -> Result<(usize, usize), CuckooError> where
+                         -> Result<(&mut Bucket<K, V>, usize), CuckooError> where
             K: Copy,
     {
         // We must unlock i1 and i2 here, so that cuckoopath_search and
@@ -904,7 +904,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 //debug_assert!(!ti.locks.get_unchecked(lock_ind(i2)).try_lock());
                 //debug_assert!(!ti.buckets.get_unchecked(insert_bucket).occupied(insert_slot));
                 return if ti as *const _ as *mut _ == self.table_info.load(Ordering::SeqCst) {
-                    Ok((insert_bucket, insert_slot))
+                    let bucket = &mut *ti.buckets.get_unchecked(insert_bucket).get();
+                    Ok((bucket, insert_slot))
                 } else {
                     // Unlock i1 and i2 and signal to cuckoo_insert to try again. Since
                     // we set the hazard pointer to be ti, this check isn't susceptible
@@ -931,29 +932,35 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// With counter enabled, also assumes that the counter has been checked and is in bounds.
     unsafe fn cuckoo_insert(&self,
                             key: K, val: V,
-                            hv: usize, snapshot: LockTwo<K, V>) -> InsertResult<(), K, V> where
+                            hv: usize, mut snapshot: LockTwo<K, V>) -> InsertResult<(), K, V> where
             K: Copy + Eq,
     {
         //const partial_t partial = partial_key(hv);
         let partial = ();
-        match try_find_insert_bucket(&snapshot.ti, partial, &key, snapshot.i1) {
+        match try_find_insert_bucket(partial, &key, snapshot.bucket1().0) {
             Err(KeyDuplicated) => {
                 snapshot.release();
                 return Err((KeyDuplicated, key, val));
             },
-            res1 => match try_find_insert_bucket(&snapshot.ti, partial, &key, snapshot.i2) {
+            res1 => match try_find_insert_bucket(partial, &key, snapshot.bucket2().0) {
                 Err(KeyDuplicated) => {
                     snapshot.release();
                     return Err((KeyDuplicated, key, val));
                 },
                 res2 => {
                     if let Ok(res1) = res1 {
-                        add_to_bucket(&snapshot.ti, partial, key, val, snapshot.i1, res1);
+                        {
+                            let (bucket1, ti) = snapshot.bucket1();
+                            add_to_bucket(ti, partial, key, val, bucket1, res1);
+                        }
                         snapshot.release();
                         return Ok(());
                     }
                     if let Ok(res2) = res2 {
-                        add_to_bucket(&snapshot.ti, partial, key, val, snapshot.i2, res2);
+                        {
+                            let (bucket2, ti) = snapshot.bucket2();
+                            add_to_bucket(ti, partial, key, val, bucket2, res2);
+                        }
                         snapshot.release();
                         return Ok(());
                     }
@@ -977,7 +984,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 // Since we unlocked the buckets during run_cuckoo, another insert
                 // could have inserted the same key into either i1 or i2, so we
                 // check for that before doing the insert.
-                if cuckoo_contains(&key, hv, &snapshot) {
+                if cuckoo_contains(&key, hv, &mut snapshot) {
                     snapshot.release();
                     return Err((KeyDuplicated, key, val));
                 }
@@ -1074,16 +1081,16 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 V: Send + Sync,
                 S: Default + HashState + Send + Sync,
         {
+        //let ref insert_into_table = |new_map: &CuckooHashMap<K, V, S>,
+        //                             TI(old_ti): TI<K, V>,
+        //                             //old_ti: HazardPointerSet<'a, TableInfo<K, V>>,
+        //                             i: usize,
+        //                             end: usize| unsafe {
             let mut bucket = (*old_ti).buckets.as_ptr().offset(i as isize);
             //let e = end;
             //println!("Inserting {}..{}", i, e);
             let end = (*old_ti).buckets.as_ptr().offset(end as isize);
-            let mut x = 0;
             while bucket != end {
-                x = x + 1;
-                if x % 100000 == 0 {
-                    //println!("x: {} ({}..{})", x + i, i, e);
-                }
                 let kv = (*(*bucket).get()).kv.as_mut().unwrap_or_else( || intrinsics::unreachable());
                 let mut keys = kv.keys.as_mut_ptr();
                 let mut vals = kv.vals.as_mut_ptr();
@@ -1103,7 +1110,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 bucket = bucket.offset(1);
             }
             //println!("Done inserting {}..{}", i, e);
-        }
+        };
 
         unsafe {
             //println!("expand");
@@ -1150,21 +1157,24 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 let mut i = 0;
                 while i < threadnum.wrapping_sub(1) {
                     let ti = TI(&ti);
+                    let start = i.wrapping_mul(buckets_per_thread);
+                    i = i.wrapping_add(1);
+                    let end = i.wrapping_mul(buckets_per_thread);
                     let t = thread::scoped( move || {
                         insert_into_table(new_map, ti,
-                                          i.wrapping_mul(buckets_per_thread),
-                                          i.wrapping_add(1).wrapping_mul(buckets_per_thread));
+                                          start,
+                                          end);
                     });
                     ptr::write(ptr, t);
-                    i += 1;
                     vec.set_len(i);
                     ptr = ptr.offset(1);
                 }
                 {
                     let ti = TI(&ti);
+                    let start = i.wrapping_mul(buckets_per_thread);
                     let t = thread::scoped( move || {
                         insert_into_table(new_map, ti,
-                                          i.wrapping_mul(buckets_per_thread),
+                                          start,
                                           hashsize);
                     });
                     ptr::write(ptr, t);
@@ -1245,9 +1255,19 @@ struct LockTwo<'a, K, V> {
 }
 
 impl<'a, K, V> LockTwo<'a, K, V> {
-    /// Unsafe because it assumes that i1 and i2 are in bounds.
+    /// Unsafe because it assumes that i1 and i2 are in bounds and locked.
     unsafe fn release(self) {
         unlock_two(&self.ti, self.i1, self.i2);
+    }
+
+    /// Unsafe because it assumes that i1 is in bounds and locked.
+    unsafe fn bucket1(&mut self) -> (&mut Bucket<K, V>, &TableInfo<K, V>) {
+        (&mut *self.ti.buckets.get_unchecked(self.i1).get(), &self.ti)
+    }
+
+    /// Unsafe because it assumes that i2 is in bounds and locked.
+    unsafe fn bucket2(&mut self) -> (&mut Bucket<K, V>, &TableInfo<K, V>) {
+        (&mut *self.ti.buckets.get_unchecked(self.i2).get(), &self.ti)
     }
 }
 
@@ -1447,6 +1467,7 @@ fn lock_ind(bucket_ind: usize) -> usize {
 
 /// hashsize returns the number of buckets corresponding to a given
 /// hashpower.
+/// Invariant: always returns a nonzero value.
 #[inline(always)]
 fn hashsize(hashpower: usize) -> usize {
     // TODO: make sure Rust can't UB on too large inputs or we'll make this unsafe.
@@ -1457,7 +1478,8 @@ fn hashsize(hashpower: usize) -> usize {
 /// given hashpower.
 #[inline(always)]
 fn hashmask(hashpower: usize) -> usize {
-    hashsize(hashpower) - 1
+    // Subtract is always safe because hashsize() always returns a positive value.
+    hashsize(hashpower).wrapping_sub(1)
 }
 
 /// hashed_key hashes the given key.
@@ -1635,10 +1657,8 @@ unsafe fn cuckoopath_move<K, V>(ti: &TableInfo<K, V>,
     while depth > 0 {
         let from = cuckoo_path.as_ptr().offset(depth.wrapping_sub(1) as isize);
         let to = cuckoo_path.as_ptr().offset(depth as isize);
-        let fb = (*from).bucket;
-        let fs = (*from).slot;
-        let tb = (*to).bucket;
-        let ts = (*to).slot;
+        let CuckooRecord { bucket: fb, slot: fs, .. } = *from;
+        let CuckooRecord { bucket: tb, slot: ts, .. } = *to;
 
         let mut ob = 0;
         if depth == 1 {
@@ -1687,32 +1707,31 @@ unsafe fn cuckoopath_move<K, V>(ti: &TableInfo<K, V>,
         } else {
             unlock_two(ti, fb, tb);
         }
-        depth -= 1;
+        // Always safe because depth > 0 was a loop precondition and wasn't modified at all in the
+        // rest of the loop.
+        depth = depth.wrapping_sub(1);
     }
     true
 }
 
 /// try_read_from_bucket will search the bucket for the given key and store
 /// the associated value if it finds it.
-///
-/// Unsafe because it assumes i is in bounds and locked.
-unsafe fn try_read_from_bucket<K, V, P>
-                              (ti: &TableInfo<K, V>, _partial: P,
-                               key: &K, i: usize) -> Option<V> where
+fn try_read_from_bucket<K, V, P>(_partial: P, key: &K, bucket: &Bucket<K, V>) -> Option<V> where
         K: Copy + Eq,
         V: Copy,
 {
-    let bucket = &*ti.buckets.get_unchecked(i).get();
-    for j in Range::new(0, SLOT_PER_BUCKET) {
-        if !bucket.occupied(j) {
-            continue;
-        }
-        // For now, we know we are "simple" so we skip this part.
-        // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
-        //     continue;
-        // }
-        if key == bucket.key(j) {
-            return Some(*bucket.val(j));
+    unsafe {
+        for j in Range::new(0, SLOT_PER_BUCKET) {
+            if !bucket.occupied(j) {
+                continue;
+            }
+            // For now, we know we are "simple" so we skip this part.
+            // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
+            //     continue;
+            // }
+            if key == bucket.key(j) {
+                return Some(*bucket.val(j));
+            }
         }
     }
     None
@@ -1720,24 +1739,21 @@ unsafe fn try_read_from_bucket<K, V, P>
 
 /// check_in_bucket will search the bucket for the given key and return true
 /// if the key is in the bucket, and false if it isn't.
-///
-/// Unsafe because it assumes i is in bounds and locked.
-unsafe fn check_in_bucket<K, V, P>
-                         (ti: &TableInfo<K, V>, _partial: P,
-                          key: &K, i: usize) -> bool where
+fn check_in_bucket<K, V, P>(_partial: P, key: &K, bucket: &Bucket<K, V>) -> bool where
         K: Copy + Eq,
 {
-    let bucket = &*ti.buckets.get_unchecked(i).get();
-    for j in Range::new(0, SLOT_PER_BUCKET) {
-        if !bucket.occupied(j) {
-            continue;
-        }
-        // For now, we know we are "simple" so we skip this part.
-        // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
-        //     continue;
-        // }
-        if key == bucket.key(j) {
-            return true;
+    unsafe {
+        for j in Range::new(0, SLOT_PER_BUCKET) {
+            if !bucket.occupied(j) {
+                continue;
+            }
+            // For now, we know we are "simple" so we skip this part.
+            // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
+            //     continue;
+            // }
+            if key == bucket.key(j) {
+                return true;
+            }
         }
     }
     false
@@ -1745,16 +1761,16 @@ unsafe fn check_in_bucket<K, V, P>
 
 /// add_to_bucket will insert the given key-value pair into the slot.
 ///
-/// Unsafe because it assumes i and j are in bounds, i is locked, and j is not occupied.
-/// With counter enabled, also assumes that the counter has been checked and is in bounds.
-unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
+/// Unsafe because (with counter enabled) it assumes that the counter has been checked and is in
+/// bounds.
+unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>,
+                                 _partial: P,
                                  key: K, val: V,
-                                 i: usize, j: usize) where
+                                 bucket: &mut Bucket<K, V>, j: usize) where
         K: Copy + Eq,
         /*K: fmt::Debug,*/
         /*V: fmt::Debug,*/
 {
-    let bucket = &mut *ti.buckets.get_unchecked(i).get();
     //debug_assert!(!bucket.occupied(j));
     // For now, we know we are "simple" so we skip this part.
     //if (!is_simple) {
@@ -1779,28 +1795,27 @@ unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
 /// empty slot if it finds one, or -1 if it doesn't. Regardless, it will
 /// search the entire bucket and return false if it finds the key already in
 /// the table (duplicate key error) and true otherwise.
-///
-/// Unsafe because it assumes i is in bounds and locked.
-unsafe fn try_find_insert_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
-                                          key: &K,
-                                          i: usize)
-                                          -> Result<usize, InsertError> where
+fn try_find_insert_bucket<K, V, P>(_partial: P,
+                                   key: &K,
+                                   bucket: &Bucket<K, V>)
+                                   -> Result<usize, InsertError> where
         K: Copy + Eq,
 {
     let mut found_empty = Err(TableFull);
-    let bucket = &*ti.buckets.get_unchecked(i).get();
-    for k in Range::new(0, SLOT_PER_BUCKET) {
-        if bucket.occupied(k) {
-            // For now, we know we are "simple" so we skip this part.
-            // if (!is_simple && partial != ti->buckets_[i].partial(k)) {
-            //     continue;
-            // }
-            if key == bucket.key(k) {
-                return Err(KeyDuplicated);
-            }
-        } else {
-            if let Err(_) = found_empty {
-                found_empty = Ok(k);
+    unsafe {
+        for k in Range::new(0, SLOT_PER_BUCKET) {
+            if bucket.occupied(k) {
+                // For now, we know we are "simple" so we skip this part.
+                // if (!is_simple && partial != ti->buckets_[i].partial(k)) {
+                //     continue;
+                // }
+                if key == bucket.key(k) {
+                    return Err(KeyDuplicated);
+                }
+            } else {
+                if let Err(_) = found_empty {
+                    found_empty = Ok(k);
+                }
             }
         }
     }
@@ -1809,16 +1824,15 @@ unsafe fn try_find_insert_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
 /// try_del_from_bucket will search the bucket for the given key, and set the
 /// slot of the key to empty if it finds it.
 ///
-/// Unsafe because it assumes i is in bounds and locked.
-/// With counter enabled, also assumes that the counter has been checked and is in bounds.
-unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
+/// Unsafe because (with counter enabled) it assumes that the counter has been checked and is in
+/// bounds.
+unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>,
+                                       _partial: P,
                                        key: &K,
-                                       i: usize)
+                                       bucket: &mut Bucket<K, V>)
                                        -> Option<V> where
         K: Eq,
 {
-    // Safe because we have the lock.
-    let bucket = &mut *ti.buckets.get_unchecked(i).get();
     for j in Range::new(0, SLOT_PER_BUCKET) {
         if !bucket.occupied(j) {
             continue;
@@ -1848,26 +1862,23 @@ unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
 
 /// try_update_bucket will search the bucket for the given key and change its
 /// associated value if it finds it.
-///
-/// Unsafe because it assumes i is in bounds and locked.
-unsafe fn try_update_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
-                                     key: &K, value: V, i: usize)
-                                     -> Result<V, V> where
+fn try_update_bucket<K, V, P>(_partial: P, key: &K, value: V, bucket: &mut Bucket<K, V>)
+                              -> Result<V, V> where
         K: Eq,
         V: Copy,
 {
-    // Safe because we have the lock.
-    let bucket = &mut *ti.buckets.get_unchecked(i).get();
-    for j in Range::new(0, SLOT_PER_BUCKET) {
-        if !bucket.occupied(j) {
-            continue;
-        }
-        // For now, we know we are "simple" so we skip this part.
-        // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
-        //     continue;
-        // }
-        if bucket.key(j) == key {
-            return Ok(mem::replace(bucket.val_mut(j), value))
+    unsafe {
+        for j in Range::new(0, SLOT_PER_BUCKET) {
+            if !bucket.occupied(j) {
+                continue;
+            }
+            // For now, we know we are "simple" so we skip this part.
+            // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
+            //     continue;
+            // }
+            if bucket.key(j) == key {
+                return Ok(mem::replace(bucket.val_mut(j), value))
+            }
         }
     }
     Err(value)
@@ -1875,27 +1886,25 @@ unsafe fn try_update_bucket<K, V, P>(ti: &TableInfo<K, V>, _partial: P,
 
 /// try_update_bucket_fn will search the bucket for the given key and change
 /// its associated value with the given function if it finds it.
-///
-/// Unsafe because it assumes i is in bounds and locked.
-unsafe fn try_update_bucket_fn<K, V, P, F, T>(ti: &TableInfo<K, V>, _partial: P,
-                                              key: &K, updater: &mut F, i: usize)
-                                              -> Option<T> where
+fn try_update_bucket_fn<K, V, P, F, T>(_partial: P,
+                                       key: &K, updater: &mut F, bucket: &mut Bucket<K, V>)
+                                       -> Option<T> where
         K: Eq,
         F: FnMut(&mut V) -> T,
 {
-    // Safe because we have the lock.
-    let bucket = &mut *ti.buckets.get_unchecked(i).get();
-    for j in Range::new(0, SLOT_PER_BUCKET) {
-        if !bucket.occupied(j) {
-            continue;
-        }
-        // For now, we know we are "simple" so we skip this part.
-        // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
-        //     continue;
-        // }
-        if bucket.key(j) == key {
-            let res = updater(bucket.val_mut(j));
-            return Some(res);
+    unsafe {
+        for j in Range::new(0, SLOT_PER_BUCKET) {
+            if !bucket.occupied(j) {
+                continue;
+            }
+            // For now, we know we are "simple" so we skip this part.
+            // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
+            //     continue;
+            // }
+            if bucket.key(j) == key {
+                let res = updater(bucket.val_mut(j));
+                return Some(res);
+            }
         }
     }
     None
@@ -1906,14 +1915,14 @@ unsafe fn try_update_bucket_fn<K, V, P, F, T>(ti: &TableInfo<K, V>, _partial: P,
 /// and released outside the function.
 ///
 /// Unsafe because it expects the locks to be taken, and i1 and i2 to be in bounds.
-unsafe fn cuckoo_find<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -> Option<V> where
+unsafe fn cuckoo_find<K, V>(key: &K, _hv: usize, snapshot: &mut LockTwo<K, V>) -> Option<V> where
         K: Copy + Eq,
         V: Copy,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    try_read_from_bucket(&snapshot.ti, partial, key, snapshot.i1)
-        .or_else( || try_read_from_bucket(&snapshot.ti, partial, key, snapshot.i2))
+    try_read_from_bucket(partial, key, snapshot.bucket1().0)
+        .or_else( || try_read_from_bucket(partial, key, snapshot.bucket2().0))
 }
 
 /// cuckoo_contains searches the table for the given key, returning true if
@@ -1921,13 +1930,13 @@ unsafe fn cuckoo_find<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -> Op
 /// and released outside the function.
 ///
 /// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
-unsafe fn cuckoo_contains<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -> bool where
+unsafe fn cuckoo_contains<K, V>(key: &K, _hv: usize, snapshot: &mut LockTwo<K, V>) -> bool where
         K: Copy + Eq,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    check_in_bucket(&snapshot.ti, partial, key, snapshot.i1)
-        || check_in_bucket(&snapshot.ti, partial, key, snapshot.i2)
+    check_in_bucket(partial, key, snapshot.bucket1().0)
+        || check_in_bucket(partial, key, snapshot.bucket2().0)
 }
 
 /// cuckoo_delete searches the table for the given key and sets the slot with
@@ -1937,14 +1946,21 @@ unsafe fn cuckoo_contains<K, V>(key: &K, _hv: usize, snapshot: &LockTwo<K, V>) -
 /// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
 /// With counter enabled, also assumes that the counter has been checked and is in bounds.
 unsafe fn cuckoo_delete<K, V>(key: &K,
-                              _hv: usize, snapshot: &LockTwo<K, V>) -> Option<V> where
+                              _hv: usize, snapshot: &mut LockTwo<K, V>) -> Option<V> where
         K: Eq,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    match try_del_from_bucket(&snapshot.ti, partial, key, snapshot.i1) {
+    let res = {
+        let (bucket1, ti) = snapshot.bucket1();
+        try_del_from_bucket(ti, partial, key, bucket1)
+    };
+    match res {
         v @ Some(_) => v,
-        None => try_del_from_bucket(&snapshot.ti, partial, key, snapshot.i2)
+        None => {
+            let (bucket2, ti) = snapshot.bucket2();
+            try_del_from_bucket(ti, partial, key, bucket2)
+        }
     }
 }
 
@@ -1954,15 +1970,15 @@ unsafe fn cuckoo_delete<K, V>(key: &K,
 ///
 /// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
 unsafe fn cuckoo_update<K,V>(key: &K, val: V,
-                             _hv: usize, snapshot: &LockTwo<K, V>) -> Result<V, V> where
+                             _hv: usize, snapshot: &mut LockTwo<K, V>) -> Result<V, V> where
         K: Eq,
         V: Copy,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    match try_update_bucket(&snapshot.ti, partial, key, val, snapshot.i1) {
+    match try_update_bucket(partial, key, val, snapshot.bucket1().0) {
         v @ Ok(_) => v,
-        Err(val) => try_update_bucket(&snapshot.ti, partial, key, val, snapshot.i2)
+        Err(val) => try_update_bucket(partial, key, val, snapshot.bucket2().0)
     }
 }
 
@@ -1973,15 +1989,15 @@ unsafe fn cuckoo_update<K,V>(key: &K, val: V,
 ///
 /// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
 unsafe fn cuckoo_update_fn<K, V, F, T>(key: &K, updater: &mut F,
-                                       _hv: usize, snapshot: &LockTwo<K, V>) -> Option<T> where
+                                       _hv: usize, snapshot: &mut LockTwo<K, V>) -> Option<T> where
         K: Eq,
         F: FnMut(&mut V) -> T,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    match try_update_bucket_fn(&snapshot.ti, partial, key, updater, snapshot.i1) {
+    match try_update_bucket_fn(partial, key, updater, snapshot.bucket1().0) {
         v @ Some(_) => v,
-        None => try_update_bucket_fn(&snapshot.ti, partial, key, updater, snapshot.i2)
+        None => try_update_bucket_fn(partial, key, updater, snapshot.bucket2().0)
     }
 }
 
@@ -2008,7 +2024,10 @@ fn cuckoo_size<K, V>(ti: &TableInfo<K, V>) -> isize {
 /// The load factor is approximate and may be negative.
 #[cfg(feature = "counter")]
 fn cuckoo_loadfactor<K, V>(ti: &TableInfo<K, V>) -> f64 {
-    cuckoo_size(ti) as f64 / SLOT_PER_BUCKET as f64 / hashsize(ti.hashpower) as f64
+    unsafe {
+        // The safety here relies on hashsize() always being nonzero.
+        intrinsics::unchecked_sdiv(cuckoo_size(ti) as f64 / SLOT_PER_BUCKET as f64, hashsize(ti.hashpower) as f64)
+    }
 }
 
 #[cfg(test)]
