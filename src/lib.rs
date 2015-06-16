@@ -43,6 +43,7 @@ mod nodemap;
 mod simd;
 pub mod spinlock;
 mod sys;
+mod table_info;
 
 #[cfg(test)]
 mod tests {
