@@ -80,7 +80,7 @@ struct GlobalHazardPointerList {
     lock: StaticMutex,
 }
 
-#[cold]
+#[cold] #[inline(never)]
 pub fn new_hazard_pointer() -> &'static HazardPointer {
     unsafe {
         let _guard = GLOBAL_HAZARD_POINTERS.lock.lock();

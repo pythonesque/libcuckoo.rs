@@ -12,7 +12,7 @@ use std::thread;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use super::iter::Range;
 use super::hazard_pointer::{check_hazard_pointer, delete_unused, HazardPointer, HazardPointerSet};
-use super::table_info::{self, AllUnlocker, Bucket, LockTwo, SLOT_PER_BUCKET, TableInfo};
+use super::table_info::{self, AllUnlocker, Bucket, LockTwo, SlotIndex, SlotIndexIter, SLOT_PER_BUCKET, TableInfo};
 
 /// DEFAULT_SIZE is the default number of elements in an empty hash
 /// table
@@ -434,12 +434,12 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             let starting_slot = x.pathcode % SLOT_PER_BUCKET;
             for i in Range::new(0, SLOT_PER_BUCKET) {
                 if q.full() { break; }
-                let slot = (starting_slot.wrapping_add(i)) % SLOT_PER_BUCKET;
+                let slot = SlotIndex::new(starting_slot.wrapping_add(i));
                 table_info::lock(ti, x.bucket);
                 let bucket = &*ti.buckets.get_unchecked(x.bucket).get();
                 if !bucket.occupied(slot) {
                     // We can terminate the search here
-                    x.pathcode = x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(slot);
+                    x.pathcode = x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(*slot);
                     table_info::unlock(ti, x.bucket);
                     return x;
                 }
@@ -451,7 +451,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                     let hv = hashed_key(&self.hash_state, bucket.key(slot));
                     table_info::unlock(ti, x.bucket);
                     let y = BSlot::new(alt_index(ti, hv, x.bucket),
-                                       x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(slot),
+                                       x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(*slot),
                                        x.depth.wrapping_add(1));
                     q.enqueue(y);
                 }
@@ -488,7 +488,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let mut curr = end;
         while curr != start {
             curr = curr.offset(-1);
-            (*curr).slot = x.pathcode % SLOT_PER_BUCKET;
+            (*curr).slot = SlotIndex::new(x.pathcode);
             x.pathcode /= SLOT_PER_BUCKET;
         }
         // Fill in the cuckoo_path buckets and keys from the beginning to the
@@ -600,7 +600,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
     unsafe fn run_cuckoo(&self,
                          ti: &TableInfo<K, V>, i1: usize, i2: usize)
-                         -> Result<(&mut Bucket<K, V>, usize), CuckooError> where
+                         -> Result<(&mut Bucket<K, V>, SlotIndex), CuckooError> where
             K: Copy,
     {
         // We must unlock i1 and i2 here, so that cuckoopath_search and
@@ -1061,7 +1061,7 @@ const MAX_BFS_PATH_LEN: u8 = 5;
 /// CuckooRecord holds one position in a cuckoo path.
 struct CuckooRecord<K> {
     bucket: usize,
-    slot: usize,
+    slot: SlotIndex,
     key: K,
 }
 
@@ -1256,18 +1256,13 @@ fn try_read_from_bucket<K, V, P>(_partial: P, key: &K, bucket: &Bucket<K, V>) ->
         K: Copy + Eq,
         V: Copy,
 {
-    unsafe {
-        for j in Range::new(0, SLOT_PER_BUCKET) {
-            if !bucket.occupied(j) {
-                continue;
-            }
-            // For now, we know we are "simple" so we skip this part.
-            // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
-            //     continue;
-            // }
-            if key == bucket.key(j) {
-                return Some(*bucket.val(j));
-            }
+    for slot in bucket.slots() {
+        // For now, we know we are "simple" so we skip this part.
+        // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
+        //     continue;
+        // }
+        if key == slot.key() {
+            return Some(*slot.val());
         }
     }
     None
@@ -1278,18 +1273,13 @@ fn try_read_from_bucket<K, V, P>(_partial: P, key: &K, bucket: &Bucket<K, V>) ->
 fn check_in_bucket<K, V, P>(_partial: P, key: &K, bucket: &Bucket<K, V>) -> bool where
         K: Copy + Eq,
 {
-    unsafe {
-        for j in Range::new(0, SLOT_PER_BUCKET) {
-            if !bucket.occupied(j) {
-                continue;
-            }
-            // For now, we know we are "simple" so we skip this part.
-            // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
-            //     continue;
-            // }
-            if key == bucket.key(j) {
-                return true;
-            }
+    for slot in bucket.slots() {
+        // For now, we know we are "simple" so we skip this part.
+        // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
+        //     continue;
+        // }
+        if key == slot.key() {
+            return true;
         }
     }
     false
@@ -1302,7 +1292,7 @@ fn check_in_bucket<K, V, P>(_partial: P, key: &K, bucket: &Bucket<K, V>) -> bool
 unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>,
                                  _partial: P,
                                  key: K, val: V,
-                                 bucket: &mut Bucket<K, V>, j: usize) where
+                                 bucket: &mut Bucket<K, V>, j: SlotIndex) where
         K: Copy + Eq,
         /*K: fmt::Debug,*/
         /*V: fmt::Debug,*/
@@ -1335,12 +1325,12 @@ unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>,
 fn try_find_insert_bucket<K, V, P>(_partial: P,
                                    key: &K,
                                    bucket: &Bucket<K, V>)
-                                   -> Result<usize, InsertError> where
+                                   -> Result<SlotIndex, InsertError> where
         K: Copy + Eq,
 {
     let mut found_empty = Err(TableFull);
-    unsafe {
-        for k in Range::new(0, SLOT_PER_BUCKET) {
+    for k in SlotIndexIter::new() {
+        unsafe {
             if bucket.occupied(k) {
                 // For now, we know we are "simple" so we skip this part.
                 // if (!is_simple && partial != ti->buckets_[i].partial(k)) {
@@ -1370,10 +1360,7 @@ unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>,
                                        -> Option<V> where
         K: Eq,
 {
-    for j in Range::new(0, SLOT_PER_BUCKET) {
-        if !bucket.occupied(j) {
-            continue;
-        }
+    for mut slot in bucket.slots_mut() {
         // For now, we know we are "simple" so we skip this part.
         // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
         //     continue;
@@ -1389,8 +1376,8 @@ unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>,
         }
         #[cfg(not(feature = "counter"))]
         fn delete_counter<K, V>(_: &TableInfo<K, V>) {}
-        if bucket.key(j) == key {
-            let (_, v) = bucket.erase_kv(j);
+        if slot.key() == key {
+            let (_, v) = slot.erase();
             delete_counter(ti);
             return Some(v);
         }
@@ -1405,18 +1392,13 @@ fn try_update_bucket<K, V, P>(_partial: P, key: &K, value: V, bucket: &mut Bucke
         K: Eq,
         V: Copy,
 {
-    unsafe {
-        for j in Range::new(0, SLOT_PER_BUCKET) {
-            if !bucket.occupied(j) {
-                continue;
-            }
-            // For now, we know we are "simple" so we skip this part.
-            // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
-            //     continue;
-            // }
-            if bucket.key(j) == key {
-                return Ok(mem::replace(bucket.val_mut(j), value))
-            }
+    for mut slot in bucket.slots_mut() {
+        // For now, we know we are "simple" so we skip this part.
+        // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
+        //     continue;
+        // }
+        if slot.key() == key {
+            return Ok(mem::replace(slot.val(), value))
         }
     }
     Err(value)
@@ -1430,19 +1412,14 @@ fn try_update_bucket_fn<K, V, P, F, T>(_partial: P,
         K: Eq,
         F: FnMut(&mut V) -> T,
 {
-    unsafe {
-        for j in Range::new(0, SLOT_PER_BUCKET) {
-            if !bucket.occupied(j) {
-                continue;
-            }
-            // For now, we know we are "simple" so we skip this part.
-            // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
-            //     continue;
-            // }
-            if bucket.key(j) == key {
-                let res = updater(bucket.val_mut(j));
-                return Some(res);
-            }
+    for mut slot in bucket.slots_mut() {
+        // For now, we know we are "simple" so we skip this part.
+        // if (!is_simple && ti->buckets_[i].partial(j) != partial) {
+        //     continue;
+        // }
+        if slot.key() == key {
+            let res = updater(slot.val());
+            return Some(res);
         }
     }
     None
@@ -1578,10 +1555,11 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
-    use super::{Depth, K_NUM_LOCKS, MAX_BFS_PATH_LEN, MAX_CUCKOO_COUNT, SLOT_PER_BUCKET};
+    use super::{Depth, MAX_BFS_PATH_LEN, MAX_CUCKOO_COUNT};
     use super::CuckooHashMap;
     use super::super::iter::Range;
     use super::super::nodemap::FnvHasher;
+    use super::super::table_info::{K_NUM_LOCKS, SLOT_PER_BUCKET};
 
     #[test]
     fn slot_per_bucket_nonzero() {

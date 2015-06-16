@@ -2,7 +2,9 @@ use num_cpus;
 use std::cell::UnsafeCell;
 use std::cmp::Ordering::{Less, Greater, Equal};
 use std::intrinsics;
+use std::marker::PhantomData;
 use std::mem;
+use std::ops::Deref;
 use std::ptr;
 use super::hazard_pointer::HazardPointerSet;
 use super::spinlock::SpinLock;
@@ -13,13 +15,169 @@ use super::sys::arch::cpuid;
 pub const SLOT_PER_BUCKET: usize = 4;
 
 /// number of locks in the locks_ array
-const K_NUM_LOCKS: usize = 1 << 16;
+pub const K_NUM_LOCKS: usize = 1 << 16;
 
 //#[unsafe_no_drop_flag]
 pub struct BucketInner<K, V> {
     pub keys: [K ; SLOT_PER_BUCKET],
 
     pub vals: [V ; SLOT_PER_BUCKET],
+}
+
+/// Guaranteed to hold an index that is in-bounds for any bucket's occupied vector(i.e. the index
+/// is less than SLOT_PER_BUCKET).
+#[derive(Clone,Copy)]
+pub struct SlotIndex(usize);
+
+impl SlotIndex {
+    #[inline]
+    pub /*unsafe */fn new(bucket: usize) -> Self {
+        SlotIndex(bucket % SLOT_PER_BUCKET)
+    }
+}
+
+impl Deref for SlotIndex {
+    type Target = usize;
+
+    fn deref(&self) -> &usize {
+        &self.0
+    }
+}
+
+pub struct SlotIndexIter {
+    i: usize,
+}
+
+impl SlotIndexIter {
+    #[inline]
+    pub fn new() -> Self {
+        SlotIndexIter { i: 0 }
+    }
+}
+
+impl Iterator for SlotIndexIter
+{
+    type Item = SlotIndex;
+
+    #[inline]
+    fn next(&mut self) -> Option<SlotIndex> {
+        // FIXME #24660: this may start returning Some after returning
+        // None if the + overflows. This is OK per Iterator's
+        // definition, but it would be really nice for a core iterator
+        // like `x..y` to be as well behaved as
+        // possible. Unfortunately, for types like `i32`, LLVM
+        // mishandles the version that places the mutation inside the
+        // `if`: it seems to optimise the `Option<i32>` in a way that
+        // confuses it.
+        let mut n = self.i + 1;
+        mem::swap(&mut n, &mut self.i);
+        if n < SLOT_PER_BUCKET {
+            Some(SlotIndex(n))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (SLOT_PER_BUCKET - self.i, Some(SLOT_PER_BUCKET - self.i))
+    }
+}
+
+pub struct Slot<'a, K: 'a, V: 'a> {
+    bucket: &'a Bucket<K, V>,
+    index: SlotIndex,
+}
+
+impl<'a, K, V> Slot<'a, K, V> {
+    pub fn key(&self) -> &K {
+        unsafe {
+            self.bucket.key(self.index)
+        }
+    }
+
+    pub fn val(&self) -> &V {
+        unsafe {
+            self.bucket.val(self.index)
+        }
+    }
+}
+
+pub struct SlotIter<'a, K: 'a, V: 'a> {
+    bucket: &'a Bucket<K, V>,
+    iter: SlotIndexIter,
+}
+
+impl<'a, K, V> Iterator for SlotIter<'a, K, V> {
+    type Item = Slot<'a, K, V>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Slot<'a, K, V>> {
+        for i in &mut self.iter {
+            if self.bucket.occupied(i) {
+                return Some(Slot { bucket: self.bucket, index: i });
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+pub struct SlotMut<'a, K: 'a, V: 'a> {
+    bucket: *mut Bucket<K, V>,
+    index: SlotIndex,
+    marker: PhantomData<&'a mut Bucket<K, V>>
+}
+
+impl<'a, K, V> SlotMut<'a, K, V> {
+    pub fn key(&mut self) -> &mut K {
+        unsafe {
+            (*self.bucket).key_mut(self.index)
+        }
+    }
+
+    pub fn val(&mut self) -> &mut V {
+        unsafe {
+            (*self.bucket).val_mut(self.index)
+        }
+    }
+
+    pub fn erase(self) -> (K, V) {
+        unsafe {
+            (*self.bucket).erase_kv(self.index)
+        }
+    }
+}
+
+pub struct SlotIterMut<'a, K: 'a, V: 'a> {
+    bucket: *mut Bucket<K, V>,
+    iter: SlotIndexIter,
+    marker: PhantomData<&'a mut Bucket<K, V>>
+}
+
+impl<'a, K, V> Iterator for SlotIterMut<'a, K, V> {
+    type Item = SlotMut<'a, K, V>;
+
+    #[inline]
+    fn next(&mut self) -> Option<SlotMut<'a, K, V>> {
+        for i in &mut self.iter {
+            unsafe {
+                if (*self.bucket).occupied(i) {
+                    return Some(SlotMut { bucket: self.bucket, index: i, marker: PhantomData });
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
 }
 
 /// The Bucket type holds SLOT_PER_BUCKET keys and values, and a occupied
@@ -34,52 +192,49 @@ pub struct Bucket<K, V> {
 }
 
 impl<K, V> Bucket<K, V> {
-    /// Unsafe because it does not perform bounds checking.
     #[inline(always)]
-    pub unsafe fn occupied(&self, ind: usize) -> bool {
-        *self.occupied.get_unchecked(ind)
+    pub fn occupied(&self, SlotIndex(ind): SlotIndex) -> bool {
+        unsafe {
+            *self.occupied.get_unchecked(ind)
+        }
     }
 
-    /// Unsafe because it does not perform bounds checking or ensure the location was already
-    /// occupied.
+    /// Unsafe because it does not ensure the location was already occupied.
     #[inline(always)]
-    pub unsafe fn key(&self, ind: usize) -> &K {
+    pub unsafe fn key(&self, SlotIndex(ind): SlotIndex) -> &K {
         self.kv.as_ref().unwrap_or_else( || intrinsics::unreachable()).keys.get_unchecked(ind)
     }
 
-    /// Unsafe because it does not perform bounds checking or ensure the location was already
-    /// occupied.
+    /// Unsafe because it does not ensure the location was already occupied.
     #[inline(always)]
-    unsafe fn key_mut(&mut self, ind: usize) -> &mut K {
+    unsafe fn key_mut(&mut self, SlotIndex(ind): SlotIndex) -> &mut K {
         self.kv.as_mut().unwrap_or_else( || intrinsics::unreachable()).keys.get_unchecked_mut(ind)
     }
 
-    /// Unsafe because it does not perform bounds checking or ensure the location was already
-    /// occupied.
+    /// Unsafe because it does not ensure the location was already occupied.
     #[inline(always)]
-    pub unsafe fn val(&self, ind: usize) -> &V {
+    pub unsafe fn val(&self, SlotIndex(ind): SlotIndex) -> &V {
         self.kv.as_ref().unwrap_or_else( || intrinsics::unreachable()).vals.get_unchecked(ind)
     }
 
-    /// Unsafe because it does not perform bounds checking or ensure the location was already
-    /// occupied.
+    /// Unsafe because it does not ensure the location was already occupied.
     #[inline(always)]
-    pub unsafe fn val_mut(&mut self, ind: usize) -> &mut V {
+    pub unsafe fn val_mut(&mut self, SlotIndex(ind): SlotIndex) -> &mut V {
         self.kv.as_mut().unwrap_or_else( || intrinsics::unreachable()).vals.get_unchecked_mut(ind)
     }
 
-    /// Unsafe because it does not perform bounds checking.
     /// Does not check to make sure location was not already occupied; can leak.
-    pub unsafe fn set_kv(&mut self, ind: usize, k: K, v: V) {
-        *self.occupied.get_unchecked_mut(ind) = true;
-        let kv = self.kv.as_mut().unwrap_or_else( || intrinsics::unreachable());
-        ptr::write(kv.keys.as_mut_ptr().offset(ind as isize), k);
-        ptr::write(kv.vals.as_mut_ptr().offset(ind as isize), v);
+    pub fn set_kv(&mut self, SlotIndex(ind): SlotIndex, k: K, v: V) {
+        unsafe {
+            *self.occupied.get_unchecked_mut(ind) = true;
+            let kv = self.kv.as_mut().unwrap_or_else( || intrinsics::unreachable());
+            ptr::write(kv.keys.as_mut_ptr().offset(ind as isize), k);
+            ptr::write(kv.vals.as_mut_ptr().offset(ind as isize), v);
+        }
     }
 
-    /// Unsafe because it does not perform bounds checking or ensure the location was already
-    /// occupied.
-    pub unsafe fn erase_kv(&mut self, ind: usize) -> (K, V) {
+    /// Unsafe because it does not ensure the location was already occupied.
+    pub unsafe fn erase_kv(&mut self, SlotIndex(ind): SlotIndex) -> (K, V) {
         *self.occupied.get_unchecked_mut(ind) = false;
         let kv = self.kv.as_mut().unwrap_or_else( || intrinsics::unreachable());
         (ptr::read(kv.keys.as_mut_ptr().offset(ind as isize)),
@@ -114,6 +269,14 @@ impl<K, V> Bucket<K, V> {
                 vals = vals.offset(1);
             }
         }
+    }
+
+    pub fn slots<'a>(&'a self) -> SlotIter<'a, K, V> {
+        SlotIter { bucket: self, iter: SlotIndexIter::new() }
+    }
+
+    pub fn slots_mut<'a>(&'a mut self) -> SlotIterMut<'a, K, V> {
+        SlotIterMut { bucket: self, iter: SlotIndexIter::new(), marker: PhantomData }
     }
 }
 

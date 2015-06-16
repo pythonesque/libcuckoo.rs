@@ -201,6 +201,7 @@ fn main() {
         let mut deletes: Key = 0;
         let mut reads: Key = 0;
         for i in Range::new(j * MAX, (j + 1) * MAX) {
+            //if map.erase(&i) != Some(RED) {
             if let None = map.erase(&i) {
                 //println!("delete error");
                 unsafe { intrinsics::abort(); }
