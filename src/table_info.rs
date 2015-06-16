@@ -6,6 +6,7 @@ use std::mem;
 use std::ptr;
 use super::hazard_pointer::HazardPointerSet;
 use super::spinlock::SpinLock;
+#[cfg(feature = "counter")]
 use super::sys::arch::cpuid;
 
 /// SLOT_PER_BUCKET is the maximum number of keys per bucket

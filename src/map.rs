@@ -11,7 +11,6 @@ use std::thread;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use super::iter::Range;
 use super::hazard_pointer::{check_hazard_pointer, delete_unused, HazardPointer, HazardPointerSet};
-#[cfg(feature = "counter")]
 use super::table_info::{self, AllUnlocker, Bucket, LockTwo, SLOT_PER_BUCKET, TableInfo};
 
 /// DEFAULT_SIZE is the default number of elements in an empty hash
