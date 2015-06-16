@@ -7,6 +7,7 @@ use std::hash::{Hash, Hasher, SipHasher};
 use std::intrinsics;
 use std::mem;
 use std::ptr;
+#[cfg(not(feature="nothreads"))]
 use std::thread;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use super::iter::Range;
@@ -804,15 +805,19 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         struct TI<'a, K, V>(&'a TableInfo<K, V>) where K: 'a, V: 'a;
         unsafe impl<'a, K, V> Send for TI<'a, K, V> where K: Send, V: Send {}
         unsafe impl<'a, K, V> Sync for TI<'a, K, V> where K: Send + Sync, V: Send + Sync {}
+        #[cfg(feature="nothreads")]
+        type Res<'a> = ();
+        #[cfg(not(feature="nothreads"))]
+        type Res<'a> = thread::JoinGuard<'a, ()>;
         /// insert_into_table is a helper function used by cuckoo_expand_simple to
         /// fill up the new table.
         ///
         /// Unsafe because it expects the old table to be locked and i and end to be in bounds.
-        unsafe fn insert_into_table<'a, K, V, S>(new_map: &CuckooHashMap<K, V, S>,
-                                                 TI(old_ti): TI<K, V>,
-                                                 //old_ti: HazardPointerSet<'a, TableInfo<K, V>>,
-                                                 i: usize,
-                                                 end: usize) where
+        unsafe fn insert_into_table_<'a, K, V, S>(new_map: &CuckooHashMap<K, V, S>,
+                                                  TI(old_ti): TI<K, V>,
+                                                  //old_ti: HazardPointerSet<'a, TableInfo<K, V>>,
+                                                  i: usize,
+                                                  end: usize) where
                 K: Copy + Eq + Hash + Send + Sync,
                 V: Send + Sync,
                 S: Default + HashState + Send + Sync,
@@ -827,7 +832,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             //println!("Inserting {}..{}", i, e);
             let end = (*old_ti).buckets.as_ptr().offset(end as isize);
             while bucket != end {
-                let kv = (*(*bucket).get()).kv.as_mut().unwrap_or_else( || intrinsics::unreachable());
+                let kv = (*(*bucket).get()).kv.as_mut()
+                    .unwrap_or_else( || intrinsics::unreachable());
                 let mut keys = kv.keys.as_mut_ptr();
                 let mut vals = kv.vals.as_mut_ptr();
                 for occupied in &mut (*(*bucket).get()).occupied {
@@ -847,6 +853,34 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             }
             //println!("Done inserting {}..{}", i, e);
         };
+        /// insert_into_table is a helper function used by cuckoo_expand_simple to
+        /// fill up the new table.
+        ///
+        /// Unsafe because it expects the old table to be locked and i and end to be in bounds.
+        #[cfg(feature="nothreads")]
+        unsafe fn insert_into_table<'a, K, V, S>(new_map: &CuckooHashMap<K, V, S>,
+                                                 ti: TI<K, V>,
+                                                 //old_ti: HazardPointerSet<'a, TableInfo<K, V>>,
+                                                 i: usize,
+                                                 end: usize) -> Res<'a> where
+                K: Copy + Eq + Hash + Send + Sync,
+                V: Send + Sync,
+                S: Default + HashState + Send + Sync,
+        {
+            insert_into_table_(new_map, ti, i, end);
+        }
+        #[cfg(not(feature="nothreads"))]
+        unsafe fn insert_into_table<'a, K, V, S>(new_map: &'a CuckooHashMap<K, V, S>,
+                                                 ti: TI<'a, K, V>,
+                                                 //old_ti: HazardPointerSet<'a, TableInfo<K, V>>,
+                                                 i: usize,
+                                                 end: usize) -> Res<'a> where
+                K: Copy + Eq + Hash + Send + Sync,
+                V: Send + Sync,
+                S: Default + HashState + Send + Sync,
+        {
+            thread::scoped(move || insert_into_table_(new_map, ti, i, end) )
+        }
 
         unsafe {
             //println!("expand");
@@ -880,8 +914,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             let buckets_per_thread =
                 intrinsics::unchecked_udiv(table_info::hashsize(ti.hashpower), threadnum);
 
-            if mem::size_of::<thread::JoinGuard<()>>() != 0 &&
-               threadnum.checked_mul(mem::size_of::<thread::JoinGuard<()>>()).is_none() {
+            if mem::size_of::<Res>() != 0 &&
+               threadnum.checked_mul(mem::size_of::<Res>()).is_none() {
                 //println!("Overflow calculating join guard vector length");
                 intrinsics::abort();
             }
@@ -896,11 +930,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                     let start = i.wrapping_mul(buckets_per_thread);
                     i = i.wrapping_add(1);
                     let end = i.wrapping_mul(buckets_per_thread);
-                    let t = thread::scoped( move || {
-                        insert_into_table(new_map, ti,
-                                          start,
-                                          end);
-                    });
+                    let t = insert_into_table(new_map, ti, start, end);
                     ptr::write(ptr, t);
                     vec.set_len(i);
                     ptr = ptr.offset(1);
@@ -908,11 +938,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 {
                     let ti = TI(&ti);
                     let start = i.wrapping_mul(buckets_per_thread);
-                    let t = thread::scoped( move || {
-                        insert_into_table(new_map, ti,
-                                          start,
-                                          hashsize);
-                    });
+                    let t = insert_into_table(new_map, ti, start, hashsize);
                     ptr::write(ptr, t);
                     vec.set_len(threadnum);
                 }
@@ -1618,6 +1644,7 @@ mod tests {
     }
 
     #[bench]
+    #[cfg(not(feature="nothreads"))]
     fn bench_cuckoo_hashmap(b: &mut test::Bencher) {
         const MAX: u32 = 325_000;
         const SIZE: usize = 1 << 21;

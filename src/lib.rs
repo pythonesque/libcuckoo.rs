@@ -1,6 +1,7 @@
 //#![no_start]
-#![feature(asm,associated_consts,box_syntax,lang_items,libc,start,std_misc,thread_local,no_std,core,unsafe_no_drop_flag,/*rustc_private,*/zero_one,step_trait,optin_builtin_traits,scoped,simd)]
+#![feature(asm,associated_consts,box_syntax,lang_items,libc,start,std_misc,thread_local,no_std,core,unsafe_no_drop_flag,/*rustc_private,*/zero_one,step_trait,optin_builtin_traits,simd)]
 #![feature(const_fn)]
+#![cfg_attr(not(feature="nothreads"), feature(scoped))]
 #![cfg_attr(test, feature(test))]
 #![allow(dead_code)]
 //#![no_std]
@@ -90,11 +91,13 @@ fn main() {
     use core::intrinsics;
     use core::mem;
     use core::ops::Add;
+    #[cfg(not(feature="nothreads"))]
     use core::ptr;
     //use rustc::util::nodemap::FnvHasher;
     use std::collections::hash_state::DefaultState;
     use self::nodemap::FnvHasher;
     use self::iter::Range;
+    #[cfg(not(feature="nothreads"))]
     use std::thread;
 
 //fn start(_argc: isize, _argv: *const *const u8) {
@@ -264,6 +267,18 @@ fn main() {
         println!("({}) reads", th,);// reads);
     };
 
+    #[cfg(feature="nothreads")]
+    unsafe fn make_threads<'a, F, T>(f: &'a F, s: &'a mut [T ; NUM_THREADS as usize]) where
+            F: Fn(Key, &'a mut T) + Send + Sync + 'a,
+            T: Send,
+    {
+        for j in Range::new(0, NUM_THREADS) {
+            let stats = &mut *s.as_mut_ptr().offset(j as isize);
+            f(j, stats);
+        }
+    }
+
+    #[cfg(not(feature="nothreads"))]
     unsafe fn make_threads<'a, F, T>(f: &'a F, s: &'a mut [T ; NUM_THREADS as usize])
                                      -> [thread::JoinGuard<'a, ()>; NUM_THREADS as usize] where
             F: Fn(Key, &'a mut T) + Send + Sync + 'a,
@@ -315,13 +330,6 @@ fn main() {
         println!("upserts: {}, deletes: {}, inserts: {}, updates: {}, reads: {}",
                  upsert, delete, insert, update, read);
     }
-
-    /*
-    upsert(0);
-    delete(0);
-    insert(0);
-    update(0);
-    find(0);*/
     /*//extern crate libc;
     //extern crate time;
     extern crate clock_ticks;
