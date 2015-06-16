@@ -428,25 +428,48 @@ impl<K, V> TableInfo<K, V> {
 }
 
 pub struct LockTwo<'a, K, V> {
-    pub ti: HazardPointerSet<'a, TableInfo<K, V>>,
-    pub i1: usize,
-    pub i2: usize,
+    ti: HazardPointerSet<'a, TableInfo<K, V>>,
+    i1: usize,
+    i2: usize,
 }
 
 impl<'a, K, V> LockTwo<'a, K, V> {
     /// Unsafe because it assumes that i1 and i2 are in bounds and locked.
-    pub unsafe fn release(self) {
-        unlock_two(&self.ti, self.i1, self.i2);
+    pub unsafe fn new(ti: HazardPointerSet<'a, TableInfo<K, V>>, i1: usize, i2: usize) -> Self {
+        LockTwo { ti: ti, i1: i1, i2: i2 }
     }
 
-    /// Unsafe because it assumes that i1 is in bounds and locked.
-    pub unsafe fn bucket1(&mut self) -> (&mut Bucket<K, V>, &TableInfo<K, V>) {
-        (&mut *self.ti.buckets.get_unchecked(self.i1).get(), &self.ti)
+    #[inline]
+    pub fn ti(&self) -> &TableInfo<K, V> {
+        &self.ti
     }
 
-    /// Unsafe because it assumes that i2 is in bounds and locked.
-    pub unsafe fn bucket2(&mut self) -> (&mut Bucket<K, V>, &TableInfo<K, V>) {
-        (&mut *self.ti.buckets.get_unchecked(self.i2).get(), &self.ti)
+    #[inline]
+    pub fn i1(&self) -> usize {
+        self.i1
+    }
+
+    #[inline]
+    pub fn i2(&self) -> usize {
+        self.i2
+    }
+
+    pub fn release(self) {
+        unsafe {
+            unlock_two(&self.ti, self.i1, self.i2);
+        }
+    }
+
+    pub fn bucket1(&mut self) -> (&mut Bucket<K, V>, &TableInfo<K, V>) {
+        unsafe {
+            (&mut *self.ti.buckets.get_unchecked(self.i1).get(), &self.ti)
+        }
+    }
+
+    pub fn bucket2(&mut self) -> (&mut Bucket<K, V>, &TableInfo<K, V>) {
+        unsafe {
+            (&mut *self.ti.buckets.get_unchecked(self.i2).get(), &self.ti)
+        }
     }
 }
 
