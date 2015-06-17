@@ -25,10 +25,11 @@ impl HazardPointer {
     }
 }
 
+//#[allow(raw_pointer_derive)]
 //#[derive(Clone,Copy)]
-pub struct HazardPointerSet<'a, T> {
+pub struct HazardPointerSet<'a, T: 'a> {
     ti: NonZero<*mut T>,
-    marker: PhantomData<&'a HazardPointer>,
+    marker: PhantomData<(&'a HazardPointer, &'a T)>,
 }
 
 impl<'a, T> HazardPointerSet<'a, T> {

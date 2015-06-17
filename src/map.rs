@@ -12,7 +12,7 @@ use std::thread;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use super::iter::Range;
 use super::hazard_pointer::{check_hazard_pointer, delete_unused, HazardPointer, HazardPointerSet};
-use super::table_info::{self, AllUnlocker, Bucket, LockTwo, SlotIndex, SlotIndexIter, SLOT_PER_BUCKET, TableInfo};
+use super::table_info::{self, AllUnlocker, Bucket, BucketIndex, LockTwo, SlotIndex, SlotIndexIter, SLOT_PER_BUCKET, Snapshot, TableInfo};
 
 /// DEFAULT_SIZE is the default number of elements in an empty hash
 /// table
@@ -167,11 +167,11 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
-        let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
-
-        let st = cuckoo_find(key, hv, &mut snapshot);
-        snapshot.release();
-        st
+        self.snapshot_and_lock_two(&hazard_pointer, hv, move |mut snapshot| {
+            let st = cuckoo_find(key, hv, &mut snapshot);
+            snapshot.release();
+            st
+        })
     }
 
     /// contains searches through the table for `key`, and returns true if it
@@ -181,11 +181,11 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
-        let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
-
-        let result = cuckoo_contains(key, hv, &mut snapshot);
-        snapshot.release();
-        result
+        self.snapshot_and_lock_two(&hazard_pointer, hv, move |mut snapshot| {
+            let result = cuckoo_contains(key, hv, &mut snapshot);
+            snapshot.release();
+            result
+        })
     }
 
     /// insert puts the given key-value pair into the table. It first checks
@@ -201,11 +201,12 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, &key);
-        let snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
-        unsafe {
-            table_info::check_counterid();
-            self.cuckoo_insert_loop(&hazard_pointer, key, v, hv, snapshot)
-        }
+        self.snapshot_and_lock_two(&hazard_pointer, hv, |snapshot| {
+            unsafe {
+                table_info::check_counterid();
+                self.cuckoo_insert_loop(&hazard_pointer, key, v, hv, snapshot)
+            }
+        })
     }
 
     /// erase removes `key` and it's associated value from the table, calling
@@ -214,14 +215,14 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     pub fn erase(&self, key: &K) -> Option<V> {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
-        let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
-
-        let result = unsafe {
-            table_info::check_counterid();
-            cuckoo_delete(key, hv, &mut snapshot)
-        };
-        snapshot.release();
-        result
+        self.snapshot_and_lock_two(&hazard_pointer, hv, move |mut snapshot| {
+            let result = unsafe {
+                table_info::check_counterid();
+                cuckoo_delete(key, hv, &mut snapshot)
+            };
+            snapshot.release();
+            result
+        })
     }
 
     /// update changes the value associated with `key` to `val`. If `key` is
@@ -231,11 +232,11 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
-        let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
-
-        let result = cuckoo_update(key, val, hv, &mut snapshot);
-        snapshot.release();
-        result
+        self.snapshot_and_lock_two(&hazard_pointer, hv, move |mut snapshot| {
+            let result = cuckoo_update(key, val, hv, &mut snapshot);
+            snapshot.release();
+            result
+        })
     }
 
     /// update_fn changes the value associated with `key` with the function
@@ -248,11 +249,11 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
-        let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
-
-        let result = cuckoo_update_fn(key, &mut updater, hv, &mut snapshot);
-        snapshot.release();
-        result
+        self.snapshot_and_lock_two(&hazard_pointer, hv, move |mut snapshot| {
+            let result = cuckoo_update_fn(key, &mut updater, hv, &mut snapshot);
+            snapshot.release();
+            result
+        })
     }
 
     /// upsert is a combination of update_fn and insert. It first tries updating
@@ -266,29 +267,34 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             S: Clone + Send + Sync,
             F: FnMut(&mut V) -> T,
     {
-        let hazard_pointer = check_hazard_pointer();
+        let ref hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, &key);
         loop {
-            let mut snapshot = self.snapshot_and_lock_two(&hazard_pointer, hv);
-            match cuckoo_update_fn(&key, &mut updater, hv, &mut snapshot) {
-                v @ Some(_) => {
-                    snapshot.release();
-                    return v;
-                },
-                // We run an insert, since the update failed
-                None => unsafe {
-                    table_info::check_counterid();
-                    match self.cuckoo_insert_loop(&hazard_pointer, key, val, hv, snapshot) {
-                        Ok(()) => return None,
-                        // The only valid reason for res being false is if insert
-                        // encountered a duplicate key after releasing the locks and
-                        // performing cuckoo hashing. In this case, we retry the entire
-                        // upsert operation.
-                        Err((_, k, v)) => {
-                            key = k;
-                            val = v;
+            let updater = &mut updater;
+            match self.snapshot_and_lock_two(hazard_pointer, hv, move |mut snapshot| {
+                match cuckoo_update_fn(&key, updater, hv, &mut snapshot) {
+                    v @ Some(_) => {
+                        snapshot.release();
+                        return Ok(v);
+                    },
+                    // We run an insert, since the update failed
+                    None => unsafe {
+                        table_info::check_counterid();
+                        match self.cuckoo_insert_loop(hazard_pointer, key, val, hv, snapshot) {
+                            Ok(()) => return Ok(None),
+                            // The only valid reason for res being false is if insert
+                            // encountered a duplicate key after releasing the locks and
+                            // performing cuckoo hashing. In this case, we retry the entire
+                            // upsert operation.
+                            Err(e) => return Err(e),
                         }
                     }
+                }
+            }) {
+                Ok(res) => return res,
+                Err((_, k, v)) => {
+                    key = k;
+                    val = v;
                 }
             }
         }
@@ -335,19 +341,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         }
     }
 
-    /// snapshot_table_nolock loads the table info pointer and sets the hazard
-    /// pointer, whithout locking anything. There is a possibility that after
-    /// loading a snapshot and setting the hazard pointer, an expansion runs and
-    /// create a new version of the table, leaving the old one for deletion. To
-    /// deal with that, we check that the table_info we loaded is the same as the
-    /// current one, and if it isn't, we try again. Whenever we check if (ti !=
-    /// table_info.load()) after setting the hazard pointer, there is an ABA
-    /// issue, where the address of the new table_info equals the address of a
-    /// previously deleted one, however it doesn't matter, since we would still
-    /// be looking at the most recent table_info in that case.
-    fn snapshot_table_nolock<'a>(&self, hazard_pointer: &'a HazardPointer)
-                                 -> HazardPointerSet<'a, TableInfo<K, V>> {
-        loop {
+    fn snapshot<'a>(&self, hazard_pointer: &'a HazardPointer)
+                    -> HazardPointerSet<'a, TableInfo<K, V>> {
+       loop {
             return unsafe {
                 let ti = self.table_info.load(Ordering::SeqCst);
                 let ti = hazard_pointer.set(ti);
@@ -359,7 +355,25 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 }
                 ti
             };
-        }
+       }
+    }
+
+    /// snapshot_table_nolock loads the table info pointer and sets the hazard
+    /// pointer, whithout locking anything. There is a possibility that after
+    /// loading a snapshot and setting the hazard pointer, an expansion runs and
+    /// create a new version of the table, leaving the old one for deletion. To
+    /// deal with that, we check that the table_info we loaded is the same as the
+    /// current one, and if it isn't, we try again. Whenever we check if (ti !=
+    /// table_info.load()) after setting the hazard pointer, there is an ABA
+    /// issue, where the address of the new table_info equals the address of a
+    /// previously deleted one, however it doesn't matter, since we would still
+    /// be looking at the most recent table_info in that case.
+    /// Unsafe because it does not enforce the invariant that the returned `HazardPointer<'a> is
+    /// unique throughout the application.  This must be enforced by the caller (e.g. the various
+    /// `snapshot` methods).
+    fn snapshot_table_nolock<'a>(&self, hazard_pointer: &'a HazardPointer)
+                                 -> HazardPointerSet<'a, TableInfo<K, V>> {
+        self.snapshot(hazard_pointer)
     }
 
     /// snapshot_and_lock_two loads the table_info pointer and locks the buckets
@@ -367,22 +381,25 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// two locked buckets as a tuple. Since the positions of the bucket locks
     /// depends on the number of buckets in the table, the table_info pointer
     /// needs to be grabbed first.
-    fn snapshot_and_lock_two<'a>(&self, hazard_pointer: &'a HazardPointer, hv: usize)
-                                 -> LockTwo<'a, K, V> {
+    fn snapshot_and_lock_two<F, T>(&self, hazard_pointer: &HazardPointer, hv: usize, closure: F)
+                                   -> T
+            where F: for <'a> FnOnce(LockTwo<K, V>) -> T
+    {
         loop {
-            let ti = self.snapshot_table_nolock(hazard_pointer);
             unsafe {
-                let i1 = index_hash(&ti, hv);
-                let i2 = alt_index(&ti, hv, i1);
+                let ti = self.snapshot(hazard_pointer);
+                let ti = Snapshot::new(&ti);
+                let i1 = BucketIndex::new(&ti, hv);
+                let i2 = alt_index(&ti, hv, *i1);
                 table_info::lock_two(&ti, i1, i2);
 
                 // Check the table info again
-                if ti.as_raw() != self.table_info.load(Ordering::SeqCst) {
+                if &*ti as *const _ != self.table_info.load(Ordering::SeqCst) {
                     table_info::unlock_two(&ti, i1, i2);
                     continue;
                 }
 
-                return LockTwo::new(ti, i1, i2)
+                return closure(LockTwo::new(ti, i1, i2));
             }
         }
     }
@@ -411,46 +428,51 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// starts with the i1 and i2 buckets, and, until it finds a bucket with an
     /// empty slot, adds each slot of the bucket in the b_slot. If the queue runs
     /// out of space, it fails.
-    ///
-    /// Unsafe because it assumes that i1 and i2 are in bounds.
-    unsafe fn slot_search(&self, ti: &TableInfo<K, V>, i1: usize, i2: usize) -> BSlot {
+    fn slot_search<'a>(&self, ti: &Snapshot<'a, K, V>,
+                       i1: BucketIndex<'a>, i2: BucketIndex<'a>) -> BSlot<'a> {
         let mut q = BQueue::new();
         // The initial pathcode informs cuckoopath_search which bucket the path
         // starts on
-        q.enqueue(BSlot::new(i1, 0, 0));
-        q.enqueue(BSlot::new(i2, 1, 0));
+        unsafe {
+            q.enqueue(BSlot::new(i1, 0, 0));
+            q.enqueue(BSlot::new(i2, 1, 0));
+        }
         while !q.full() && !q.empty() {
-            let mut x = q.dequeue();
+            let mut x = unsafe {
+                q.dequeue()
+            };
             // picks a (sort-of) random slot to start from
             let starting_slot = x.pathcode % SLOT_PER_BUCKET;
             for i in Range::new(0, SLOT_PER_BUCKET) {
                 if q.full() { break; }
                 let slot = SlotIndex::new(starting_slot.wrapping_add(i));
-                table_info::lock(ti, x.bucket);
-                let bucket = &*ti.buckets.get_unchecked(x.bucket).get();
-                if !bucket.occupied(slot) {
-                    // We can terminate the search here
-                    x.pathcode = x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(*slot);
-                    table_info::unlock(ti, x.bucket);
-                    return x;
-                }
+                unsafe {
+                    table_info::lock(ti, x.bucket);
+                    let bucket = &*ti.buckets.get_unchecked(*x.bucket).get();
+                    if !bucket.occupied(slot) {
+                        // We can terminate the search here
+                        x.pathcode = x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(*slot);
+                        table_info::unlock(ti, x.bucket);
+                        return x;
+                    }
 
-                // If x has less than the maximum number of path components,
-                // create a new b_slot item, that represents the bucket we would
-                // have come from if we kicked out the item at this slot.
-                if x.depth < (MAX_BFS_PATH_LEN - 1) as Depth {
-                    let hv = hashed_key(&self.hash_state, bucket.key(slot));
-                    table_info::unlock(ti, x.bucket);
-                    let y = BSlot::new(alt_index(ti, hv, x.bucket),
-                                       x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(*slot),
-                                       x.depth.wrapping_add(1));
-                    q.enqueue(y);
+                    // If x has less than the maximum number of path components,
+                    // create a new b_slot item, that represents the bucket we would
+                    // have come from if we kicked out the item at this slot.
+                    if x.depth < (MAX_BFS_PATH_LEN - 1) as Depth {
+                        let hv = hashed_key(&self.hash_state, bucket.key(slot));
+                        table_info::unlock(ti, x.bucket);
+                        let y = BSlot::new(alt_index(ti, hv, *x.bucket),
+                                           x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(*slot),
+                                           x.depth.wrapping_add(1));
+                        q.enqueue(y);
+                    }
                 }
             }
         }
         // We didn't find a short-enough cuckoo path, so the queue ran out of
         // space. Return a failure value.
-        BSlot::new(0, 0, -1)
+        BSlot::new(BucketIndex::new(ti, 0), 0, -1)
     }
 
     /// cuckoopath_search finds a cuckoo path from one of the starting buckets to
@@ -459,125 +481,125 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// the buckets it searches, the data can change between this function and
     /// cuckoopath_move. Thus cuckoopath_move checks that the data matches the
     /// cuckoo path before changing it.
-    ///
-    /// Unsafe because it assumes that i1 and i2 are in bounds.
-    unsafe fn cuckoopath_search(&self, ti: &TableInfo<K, V>,
-                                cuckoo_path: &mut [CuckooRecord<K>; MAX_BFS_PATH_LEN as usize],
-                                i1: usize, i2: usize)
-                                -> /*([CuckooRecord<K>; MAX_BFS_PATH_LEN], Depth)*/Depth where
+    fn cuckoopath_search<'a>(&self, ti: &Snapshot<'a, K, V>,
+                             cuckoo_path: &mut [CuckooRecord<'a, K>; MAX_BFS_PATH_LEN as usize],
+                             i1: BucketIndex<'a>, i2: BucketIndex<'a>)
+                             -> /*([CuckooRecord<K>; MAX_BFS_PATH_LEN], Depth)*/Depth where
             K: Copy,
     {
-        let mut x = self.slot_search(ti, i1, i2);
-        if x.depth == -1 {
-            return -1;
-        }
-        // Fill in the cuckoo path slots from the end to the beginning
-        let start = cuckoo_path.as_mut_ptr();
-        //let end = cuckoo_path.as_ptr().offset(x.depth);
-        //let mut curr = end.offset(1);
-        let end = cuckoo_path.as_mut_ptr().offset(x.depth as isize).offset(1);
-        let mut curr = end;
-        while curr != start {
-            curr = curr.offset(-1);
-            (*curr).slot = SlotIndex::new(x.pathcode);
-            x.pathcode /= SLOT_PER_BUCKET;
-        }
-        // Fill in the cuckoo_path buckets and keys from the beginning to the
-        // end, using the final pathcode to figure out which bucket the path
-        // starts on. Since data could have been modified between slot_search
-        // and the computation of the cuckoo path, this could be an invalid
-        // cuckoo_path.
-        let mut i = if x.pathcode == 0 {
-            i1
-        } else {
-            //debug_assert!(x.pathcode == 1);
-            i2
-        };
-        while curr != end {
-            (*curr).bucket = i;
-            table_info::lock(ti, i);
-            let bucket = &*ti.buckets.get_unchecked(i).get();
-            if !bucket.occupied((*curr).slot) {
-                // We can terminate here
+        unsafe {
+            let mut x = self.slot_search(ti, i1, i2);
+            if x.depth == -1 {
+                return -1;
+            }
+            // Fill in the cuckoo path slots from the end to the beginning
+            let start = cuckoo_path.as_mut_ptr();
+            //let end = cuckoo_path.as_ptr().offset(x.depth);
+            //let mut curr = end.offset(1);
+            let end = start.offset(x.depth as isize).offset(1);
+            let mut curr = end;
+            while curr != start {
+                curr = curr.offset(-1);
+                (*curr).slot = SlotIndex::new(x.pathcode);
+                x.pathcode /= SLOT_PER_BUCKET;
+            }
+            // Fill in the cuckoo_path buckets and keys from the beginning to the
+            // end, using the final pathcode to figure out which bucket the path
+            // starts on. Since data could have been modified between slot_search
+            // and the computation of the cuckoo path, this could be an invalid
+            // cuckoo_path.
+            let mut i = if x.pathcode == 0 {
+                i1
+            } else {
+                //debug_assert!(x.pathcode == 1);
+                i2
+            };
+            while curr != end {
+                (*curr).bucket = i;
+                table_info::lock(ti, i);
+                let bucket = &*ti.buckets.get_unchecked(*i).get();
+                if !bucket.occupied((*curr).slot) {
+                    // We can terminate here
+                    table_info::unlock(ti, i);
+                    return ((curr as usize).wrapping_sub(start as usize)
+                            / mem::size_of::<CuckooRecord<K>>()) as Depth;
+                }
+                (*curr).key = *bucket.key((*curr).slot);
                 table_info::unlock(ti, i);
-                return ((curr as usize).wrapping_sub(start as usize)
-                        / mem::size_of::<CuckooRecord<K>>()) as Depth;
+                let hv = hashed_key(&self.hash_state, &(*curr).key);
+                /*debug_assert!((*curr).bucket == index_hash(ti, hv) ||
+                              (*curr).bucket == alt_index(ti, hv, index_hash(ti, hv)));*/
+                // We get the bucket that this slot is on by computing the alternate
+                // index of the previous bucket
+                i = alt_index(ti, hv, *i);
+                curr = curr.offset(1);
             }
-            (*curr).key = *bucket.key((*curr).slot);
-            table_info::unlock(ti, i);
-            let hv = hashed_key(&self.hash_state, &(*curr).key);
-            /*debug_assert!((*curr).bucket == index_hash(ti, hv) ||
-                          (*curr).bucket == alt_index(ti, hv, index_hash(ti, hv)));*/
-            // We get the bucket that this slot is on by computing the alternate
-            // index of the previous bucket
-            i = alt_index(ti, hv, i);
-            curr = curr.offset(1);
-        }
-        /*(*curr).bucket = i;
-        lock(ti, i);
-        let bucket = ti.buckets.get_unchecked(i);
-        if !bucket.occupied((*curr).slot) {
-            // We can terminate here
-            unlock(ti, i);
-            return 0;
-        }
-        (*curr).key = bucket.key((*curr).slot);
-        unlock(ti, i);*/
-        /*if (x.pathcode == 0) {
-            (*curr).bucket = i1;
-            lock(ti, i1);
-            if !ti.buckets.get_unchecked(i1).occupied((*curr).slot) {
-                // We can terminate here
-                unlock(ti, i1);
-                return 0;
-            }
-            (*curr).key = ti.buckets.get_unchecked(i1).key((*curr).slot);
-            unlock(ti, i1);
-        } else {
-            //debug_assert!(x.pathcode == 1);
-            (*curr).bucket = i2;
-            lock(ti, i2);
-            if !ti.buckets.get_unchecked(i2).occupied((*curr).slot) {
-                // We can terminate here
-                unlock(ti, i2);
-                return 0;
-            }
-            (*curr).key = ti.buckets.get_unchecked(i2).key((*curr).slot);
-            unlock(ti, i2);
-        }*/
-        /*while curr != end {
-            (*curr).bucket = i;
+            /*(*curr).bucket = i;
             lock(ti, i);
             let bucket = ti.buckets.get_unchecked(i);
             if !bucket.occupied((*curr).slot) {
                 // We can terminate here
                 unlock(ti, i);
-                return (curr as usize).wrapping_sub(start as usize) as Depth;
-            }
-            (*curr).key = bucket.key((*curr).slot);
-            unlock(ti, i);
-            let hv = hashed_key((*curr).key);
-            /*debug_assert!((*prev).bucket == index_hash(ti, prevhv) ||
-                          (*prev).bucket == alt_index(ti, prevhv, index_hash(ti,
-                                                                             prevhv)));*/
-            // We get the bucket that this slot is on by computing the alternate
-            // index of the previous bucket
-            i = alt_index(ti, hv, (*curr).bucket);
-            curr = curr.offset(1);
-            /*let i = alt_index(ti, hv, (*curr).bucket);
-            curr = curr.offset(1);
-            (*curr).bucket = i;
-            lock(ti, i);
-            let bucket = ti.buckets.get_unchecked(i);
-            if !bucket.occupied((*curr).slot) {
-                // We can terminate here
-                unlock(ti, i);
-                return (curr as usize).wrapping_sub(start as usize) as Depth;
+                return 0;
             }
             (*curr).key = bucket.key((*curr).slot);
             unlock(ti, i);*/
-        }*/
-        x.depth
+            /*if (x.pathcode == 0) {
+                (*curr).bucket = i1;
+                lock(ti, i1);
+                if !ti.buckets.get_unchecked(i1).occupied((*curr).slot) {
+                    // We can terminate here
+                    unlock(ti, i1);
+                    return 0;
+                }
+                (*curr).key = ti.buckets.get_unchecked(i1).key((*curr).slot);
+                unlock(ti, i1);
+            } else {
+                //debug_assert!(x.pathcode == 1);
+                (*curr).bucket = i2;
+                lock(ti, i2);
+                if !ti.buckets.get_unchecked(i2).occupied((*curr).slot) {
+                    // We can terminate here
+                    unlock(ti, i2);
+                    return 0;
+                }
+                (*curr).key = ti.buckets.get_unchecked(i2).key((*curr).slot);
+                unlock(ti, i2);
+            }*/
+            /*while curr != end {
+                (*curr).bucket = i;
+                lock(ti, i);
+                let bucket = ti.buckets.get_unchecked(i);
+                if !bucket.occupied((*curr).slot) {
+                    // We can terminate here
+                    unlock(ti, i);
+                    return (curr as usize).wrapping_sub(start as usize) as Depth;
+                }
+                (*curr).key = bucket.key((*curr).slot);
+                unlock(ti, i);
+                let hv = hashed_key((*curr).key);
+                /*debug_assert!((*prev).bucket == index_hash(ti, prevhv) ||
+                              (*prev).bucket == alt_index(ti, prevhv, index_hash(ti,
+                                                                                 prevhv)));*/
+                // We get the bucket that this slot is on by computing the alternate
+                // index of the previous bucket
+                i = alt_index(ti, hv, (*curr).bucket);
+                curr = curr.offset(1);
+                /*let i = alt_index(ti, hv, (*curr).bucket);
+                curr = curr.offset(1);
+                (*curr).bucket = i;
+                lock(ti, i);
+                let bucket = ti.buckets.get_unchecked(i);
+                if !bucket.occupied((*curr).slot) {
+                    // We can terminate here
+                    unlock(ti, i);
+                    return (curr as usize).wrapping_sub(start as usize) as Depth;
+                }
+                (*curr).key = bucket.key((*curr).slot);
+                unlock(ti, i);*/
+            }*/
+            x.depth
+        }
     }
 
     /// run_cuckoo performs cuckoo hashing on the table in an attempt to free up
@@ -588,10 +610,11 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// function. If run_cuckoo returns ok (success), then the slot it freed up
     /// is still locked. Otherwise it is unlocked.
     ///
-    /// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
-    unsafe fn run_cuckoo(&self,
-                         ti: &TableInfo<K, V>, i1: usize, i2: usize)
-                         -> Result<(&mut Bucket<K, V>, SlotIndex), CuckooError> where
+    /// Unsafe because it assumes that the locks are taken.
+    unsafe fn run_cuckoo<'a>(&self,
+                             ti: &Snapshot<'a, K, V>,
+                             i1: BucketIndex<'a>, i2: BucketIndex<'a>)
+                             -> Result<(&mut Bucket<K, V>, SlotIndex), CuckooError> where
             K: Copy,
     {
         // We must unlock i1 and i2 here, so that cuckoopath_search and
@@ -632,7 +655,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 //debug_assert!(!ti.locks.get_unchecked(lock_ind(i2)).try_lock());
                 //debug_assert!(!ti.buckets.get_unchecked(insert_bucket).occupied(insert_slot));
                 return if ti as *const _ as *mut _ == self.table_info.load(Ordering::SeqCst) {
-                    let bucket = &mut *ti.buckets.get_unchecked(insert_bucket).get();
+                    let bucket = &mut *ti.buckets.get_unchecked(*insert_bucket).get();
                     Ok((bucket, insert_slot))
                 } else {
                     // Unlock i1 and i2 and signal to cuckoo_insert to try again. Since
@@ -737,7 +760,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     ///
     /// Unsafe because (with counter enabled) it assumes that the counter has been checked and is in
     /// bounds.
-    unsafe fn cuckoo_insert_loop<'a>(&self, hazard_pointer: &'a HazardPointer,
+    unsafe fn cuckoo_insert_loop<'a>(&self, hazard_pointer: &HazardPointer,
                                      mut key: K, mut val: V,
                                      hv: usize,
                                      mut snapshot: LockTwo<'a, K, V>)
@@ -761,7 +784,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 // If it's failure_table_full, we have to expand the table before trying
                 // again.
                 Err((TableFull, key, val)) => {
-                    // TODO: Investigate whether adding 1 is alaways safe here.
+                    // TODO: Investigate whether adding 1 is always safe here.
                     let hashpower = hashpower.checked_add(1)
                                              .unwrap_or_else( || {
                         //println!("capacity error: off by one in cuckoo_insert_loop");
@@ -777,7 +800,12 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             };
             key = key_;
             val = val_;
-            snapshot = self.snapshot_and_lock_two(hazard_pointer, hv);
+            snapshot = self.snapshot_and_lock_two(hazard_pointer, hv, |snapshot_| {
+                // This is safe because ti was moved into cuckoo_insert_loop, so it can't be relied
+                // on outside of this function anyway, and there are no locals within this function
+                // that outlast the loop body and depend on the snapshot remaining the same.
+                mem::transmute::<_, LockTwo<'a, K, V>>(snapshot_)
+            });
         }
     }
 
@@ -945,7 +973,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             // joined now, and the join formed a synchronization point).  Keep it SeqCst anyway unless
             // it proves to be a bottleneck (note that there is one other possible way for them to be
             // written to--via deleted_unused--but it shouldn't be possible for that to run with a
-            // pointer with the same address as the old one at the same time.
+            // pointer with the same address as the old one at the same time).
             //
             // Not sure about the store... again, keeping it SeqCst for now.
             self.table_info.store(new_map.table_info.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -1003,14 +1031,6 @@ impl<K, V> CuckooHashMap<K, V, DefaultState<SipHasher>> where
     }
 }
 
-/// hashmask returns the bitmask for the buckets array corresponding to a
-/// given hashpower.
-#[inline(always)]
-fn hashmask(hashpower: usize) -> usize {
-    // Subtract is always safe because table_info::hashsize() always returns a positive value.
-    table_info::hashsize(hashpower).wrapping_sub(1)
-}
-
 /// hashed_key hashes the given key.
 #[inline(always)]
 fn hashed_key<K: ?Sized, S>(hash_state: &S, key: &K) -> usize where
@@ -1022,25 +1042,19 @@ fn hashed_key<K: ?Sized, S>(hash_state: &S, key: &K) -> usize where
     state.finish() as usize
 }
 
-/// index_hash returns the first possible bucket that the given hashed key
-/// could be.
-#[inline(always)]
-fn index_hash<K, V>(ti: &TableInfo<K, V>, hv: usize) -> usize {
-    hv & hashmask(ti.hashpower)
-}
-
 /// alt_index returns the other possible bucket that the given hashed key
 /// could be. It takes the first possible bucket as a parameter. Note that
 /// this function will return the first possible bucket if index is the
 /// second possible bucket, so alt_index(ti, hv, alt_index(ti, hv,
 /// index_hash(ti, hv))) == index_hash(ti, hv).
 #[inline(always)]
-fn alt_index<K, V>(ti: &TableInfo<K, V>, hv: usize, index: usize) -> usize {
+fn alt_index<'a, K, V>(ti: &Snapshot<'a, K, V>, hv: usize, index: usize)
+                       -> BucketIndex<'a> {
     // ensure tag is nonzero for the multiply
     // TODO: figure out if this is UB and how to mitigate it if so.
     let tag = (hv >> ti.hashpower).wrapping_add(1);
     // 0x5bd1e995 is the hash constant from MurmurHash2
-    (index ^ (tag.wrapping_mul(0x5bd1e995))) & hashmask(ti.hashpower)
+    BucketIndex::new(ti, index ^ (tag.wrapping_mul(0x5bd1e995)))
 }
 
 /*// A constexpr version of pow that we can use for static_asserts
@@ -1052,8 +1066,8 @@ static constexpr size_t const_pow(size_t a, size_t b) {
 const MAX_BFS_PATH_LEN: u8 = 5;
 
 /// CuckooRecord holds one position in a cuckoo path.
-struct CuckooRecord<K> {
-    bucket: usize,
+struct CuckooRecord<'a, K> {
+    bucket: BucketIndex<'a>,
     slot: SlotIndex,
     key: K,
 }
@@ -1063,9 +1077,9 @@ type Depth = i32;
 /// b_slot holds the information for a BFS path through the table
 #[derive(Clone, Copy)]
 #[repr(packed)]
-struct BSlot {
+struct BSlot<'a> {
     /// The bucket of the last item in the path
-    bucket: usize,
+    bucket: BucketIndex<'a>,
     /// a compressed representation of the slots for each of the buckets in
     /// the path. pathcode is sort of like a base-SLOT_PER_BUCKET number, and
     /// we need to hold at most MAX_BFS_PATH_LEN slots. Thus we need the
@@ -1076,9 +1090,9 @@ struct BSlot {
     depth: Depth,
 }
 
-impl BSlot {
+impl<'a> BSlot<'a> {
     #[inline(always)]
-    fn new(bucket: usize, pathcode: usize, depth: Depth) -> Self {
+    fn new(bucket: BucketIndex<'a>, pathcode: usize, depth: Depth) -> Self {
         //debug_assert!(depth < MAX_BFS_PATH_LEN as Depth);
         BSlot {
             bucket: bucket,
@@ -1090,9 +1104,9 @@ impl BSlot {
 
 /// b_queue is the queue used to store b_slots for BFS cuckoo hashing.
 #[repr(packed)]
-struct BQueue {
+struct BQueue<'a> {
     /// A circular array of b_slots
-    slots: [BSlot ; MAX_CUCKOO_COUNT],
+    slots: [BSlot<'a> ; MAX_CUCKOO_COUNT],
     /// The index of the head of the queue in the array
     first: usize,
     /// One past the index of the last item of the queue in the array
@@ -1111,10 +1125,10 @@ fn increment(ind: usize) -> usize {
     (ind.wrapping_add(1)) & (MAX_CUCKOO_COUNT - 1)
 }
 
-impl BQueue{
+impl<'a> BQueue<'a> {
     #[inline(always)]
     fn new() -> Self where
-            BSlot: Copy,
+            BSlot<'a>: Copy,
     {
         BQueue {
             // Perfectly safe because `BSlot` is `Copy`.
@@ -1125,14 +1139,14 @@ impl BQueue{
     }
 
     /// Unsafe because it assumes that the queue is not full.
-    unsafe fn enqueue(&mut self, x: BSlot) {
+    unsafe fn enqueue(&mut self, x: BSlot<'a>) {
         // debug_assert!(!self.full());
         *self.slots.get_unchecked_mut(self.last) = x;
         self.last = increment(self.last);
     }
 
     /// Unsafe because it assumes the queue is nonempty.
-    unsafe fn dequeue(&mut self, ) -> BSlot {
+    unsafe fn dequeue(&mut self, ) -> BSlot<'a> {
         // debug_assert!(!self.empty());
         let x = *self.slots.get_unchecked(self.first);
         self.first = increment(self.first);
@@ -1159,10 +1173,11 @@ impl BQueue{
 /// Note that if i1 or i2 is equal to cuckoo_path[0].bucket and depth == 0, this will deadlock,
 /// though this is not technically a safety issue.
 ///
-/// Unsafe because it assumes i1 and i2 are in bounds, and depth is in bounds.
-unsafe fn cuckoopath_move<K, V>(ti: &TableInfo<K, V>,
-                                cuckoo_path: &[CuckooRecord<K> ; MAX_BFS_PATH_LEN as usize],
-                                mut depth: usize, i1: usize, i2: usize) -> bool where
+/// Unsafe because it assumes depth is in bounds.
+unsafe fn cuckoopath_move<'a, K, V>(ti: &Snapshot<'a, K, V>,
+                                    cuckoo_path: &[CuckooRecord<'a, K> ; MAX_BFS_PATH_LEN as usize],
+                                    mut depth: usize, i1: BucketIndex<'a>, i2: BucketIndex<'a>)
+                                   -> bool where
         K: Copy + Eq,
 {
     if depth == 0 {
@@ -1175,7 +1190,7 @@ unsafe fn cuckoopath_move<K, V>(ti: &TableInfo<K, V>,
         let bucket = cuckoo_path.get_unchecked(0).bucket;
         // debug_assert!(bucket == i1 || bucket == i2);
         table_info::lock_two(ti, i1, i2);
-        return if !(*ti.buckets.get_unchecked(bucket).get()).occupied(cuckoo_path.get_unchecked(0).slot) {
+        return if !(*ti.buckets.get_unchecked(*bucket).get()).occupied(cuckoo_path.get_unchecked(0).slot) {
             true
         } else {
             table_info::unlock_two(ti, i1, i2);
@@ -1189,12 +1204,12 @@ unsafe fn cuckoopath_move<K, V>(ti: &TableInfo<K, V>,
         let CuckooRecord { bucket: fb, slot: fs, .. } = *from;
         let CuckooRecord { bucket: tb, slot: ts, .. } = *to;
 
-        let mut ob = 0;
+        let mut ob = BucketIndex::new(ti, 0);
         if depth == 1 {
             // Even though we are only swapping out of i1 or i2, we have to
             // lock both of them along with the slot we are swapping to,
             // since at the end of this function, i1 and i2 must be locked.
-            ob = if fb == i1 { i2 } else { i1 };
+            ob = if *fb == *i1 { i2 } else { i1 };
             table_info::lock_three(ti, fb, tb, ob);
         } else {
             table_info::lock_two(ti, fb, tb);
@@ -1206,8 +1221,8 @@ unsafe fn cuckoopath_move<K, V>(ti: &TableInfo<K, V>,
         // may have already been filled in by another thread, or the slot we
         // are moving from may be empty, both of which invalidate the swap.
         // &mut is safe because we have tkaen the locks.
-        let bucket_fb = &mut *ti.buckets.get_unchecked(fb).get();
-        let bucket_tb = &mut *ti.buckets.get_unchecked(tb).get();
+        let bucket_fb = &mut *ti.buckets.get_unchecked(*fb).get();
+        let bucket_tb = &mut *ti.buckets.get_unchecked(*tb).get();
         if bucket_fb.key(fs) != &(*from).key ||
            bucket_tb.occupied(ts) ||
            !bucket_fb.occupied(fs) {
@@ -1229,8 +1244,8 @@ unsafe fn cuckoopath_move<K, V>(ti: &TableInfo<K, V>,
             // Don't unlock fb or ob, since they are needed in
             // cuckoo_insert. Only unlock tb if it doesn't unlock the same
             // bucket as fb or ob.
-            if table_info::lock_ind(tb) != table_info::lock_ind(fb) &&
-               table_info::lock_ind(tb) != table_info::lock_ind(ob) {
+            if table_info::lock_ind(*tb) != table_info::lock_ind(*fb) &&
+               table_info::lock_ind(*tb) != table_info::lock_ind(*ob) {
                 table_info::unlock(ti, tb);
             }
         } else {

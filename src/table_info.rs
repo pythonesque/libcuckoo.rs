@@ -31,8 +31,8 @@ pub struct SlotIndex(usize);
 
 impl SlotIndex {
     #[inline]
-    pub /*unsafe */fn new(bucket: usize) -> Self {
-        SlotIndex(bucket % SLOT_PER_BUCKET)
+    pub fn new(slot: usize) -> Self {
+        SlotIndex(slot % SLOT_PER_BUCKET)
     }
 }
 
@@ -85,26 +85,26 @@ impl Iterator for SlotIndexIter
 }
 
 pub struct Slot<'a, K: 'a, V: 'a> {
-    bucket: &'a Bucket<K, V>,
+    slot: &'a Bucket<K, V>,
     index: SlotIndex,
 }
 
 impl<'a, K, V> Slot<'a, K, V> {
     pub fn key(&self) -> &K {
         unsafe {
-            self.bucket.key(self.index)
+            self.slot.key(self.index)
         }
     }
 
     pub fn val(&self) -> &V {
         unsafe {
-            self.bucket.val(self.index)
+            self.slot.val(self.index)
         }
     }
 }
 
 pub struct SlotIter<'a, K: 'a, V: 'a> {
-    bucket: &'a Bucket<K, V>,
+    slot: &'a Bucket<K, V>,
     iter: SlotIndexIter,
 }
 
@@ -114,8 +114,8 @@ impl<'a, K, V> Iterator for SlotIter<'a, K, V> {
     #[inline]
     fn next(&mut self) -> Option<Slot<'a, K, V>> {
         for i in &mut self.iter {
-            if self.bucket.occupied(i) {
-                return Some(Slot { bucket: self.bucket, index: i });
+            if self.slot.occupied(i) {
+                return Some(Slot { slot: self.slot, index: i });
             }
         }
         None
@@ -128,7 +128,7 @@ impl<'a, K, V> Iterator for SlotIter<'a, K, V> {
 }
 
 pub struct SlotMut<'a, K: 'a, V: 'a> {
-    bucket: *mut Bucket<K, V>,
+    slot: *mut Bucket<K, V>,
     index: SlotIndex,
     marker: PhantomData<&'a mut Bucket<K, V>>
 }
@@ -136,25 +136,25 @@ pub struct SlotMut<'a, K: 'a, V: 'a> {
 impl<'a, K, V> SlotMut<'a, K, V> {
     pub fn key(&mut self) -> &mut K {
         unsafe {
-            (*self.bucket).key_mut(self.index)
+            (*self.slot).key_mut(self.index)
         }
     }
 
     pub fn val(&mut self) -> &mut V {
         unsafe {
-            (*self.bucket).val_mut(self.index)
+            (*self.slot).val_mut(self.index)
         }
     }
 
     pub fn erase(self) -> (K, V) {
         unsafe {
-            (*self.bucket).erase_kv(self.index)
+            (*self.slot).erase_kv(self.index)
         }
     }
 }
 
 pub struct SlotIterMut<'a, K: 'a, V: 'a> {
-    bucket: *mut Bucket<K, V>,
+    slot: *mut Bucket<K, V>,
     iter: SlotIndexIter,
     marker: PhantomData<&'a mut Bucket<K, V>>
 }
@@ -166,8 +166,8 @@ impl<'a, K, V> Iterator for SlotIterMut<'a, K, V> {
     fn next(&mut self) -> Option<SlotMut<'a, K, V>> {
         for i in &mut self.iter {
             unsafe {
-                if (*self.bucket).occupied(i) {
-                    return Some(SlotMut { bucket: self.bucket, index: i, marker: PhantomData });
+                if (*self.slot).occupied(i) {
+                    return Some(SlotMut { slot: self.slot, index: i, marker: PhantomData });
                 }
             }
         }
@@ -272,11 +272,11 @@ impl<K, V> Bucket<K, V> {
     }
 
     pub fn slots<'a>(&'a self) -> SlotIter<'a, K, V> {
-        SlotIter { bucket: self, iter: SlotIndexIter::new() }
+        SlotIter { slot: self, iter: SlotIndexIter::new() }
     }
 
     pub fn slots_mut<'a>(&'a mut self) -> SlotIterMut<'a, K, V> {
-        SlotIterMut { bucket: self, iter: SlotIndexIter::new(), marker: PhantomData }
+        SlotIterMut { slot: self, iter: SlotIndexIter::new(), marker: PhantomData }
     }
 }
 
@@ -354,7 +354,6 @@ pub fn check_counterid() {
 #[cfg(not(feature = "counter"))]
 pub fn check_counterid() {}
 
-
 /// TableInfo contains the entire state of the hashtable. We allocate one
 /// TableInfo pointer per hash table and store all of the table memory in it,
 /// so that all the data can be atomically swapped during expansion.
@@ -427,30 +426,89 @@ impl<K, V> TableInfo<K, V> {
     }
 }
 
-pub struct LockTwo<'a, K, V> {
-    ti: HazardPointerSet<'a, TableInfo<K, V>>,
-    i1: usize,
-    i2: usize,
+#[allow(raw_pointer_derive)]
+#[derive(Clone,Copy)]
+pub struct InvariantLifetime<'id>(
+    PhantomData<*mut &'id ()>);
+
+impl<'id> InvariantLifetime<'id> {
+    pub fn new() -> InvariantLifetime<'id> {
+        InvariantLifetime(PhantomData)
+    }
+}
+
+/// Invariant that must be preserved: only one ti per Snapshot<'a, K, V>.
+#[derive(Clone,Copy)]
+pub struct Snapshot<'a, K: 'a, V: 'a> {
+    ti: &'a TableInfo<K, V>,
+    marker: InvariantLifetime<'a>
+}
+
+impl<'a, K, V> Snapshot<'a, K, V> {
+    /// Unsafe because it does not enfoce that there is only one ti per Snapshot<'a, K, V>.
+    pub unsafe fn new(ti: &'a HazardPointerSet<'a, TableInfo<K, V>>) -> Self {
+        Snapshot { ti: &ti, marker: InvariantLifetime::new() }
+    }
+}
+
+impl<'a, K, V> Deref for Snapshot<'a, K, V> {
+    type Target = TableInfo<K, V>;
+
+    fn deref(&self) -> &TableInfo<K, V> {
+        self.ti
+    }
+}
+
+/// Guaranteed to hold an index that is in-bounds for all buckets in the `TableInfo<K, V>` with
+/// `Snapshot<'a, K, V>`.  The guarantee that must be preserved is that there is precisely one
+/// `Snapshot<'a, K, V>` for a `'a`, which ensures that we don't actually need to hold on to a
+/// reference to the `TableInfo<K, V>` itself.  We uphold this guarantee using the runSt trick
+/// from Haskell (see also `BTreeMap`).
+#[derive(Clone,Copy)]
+pub struct BucketIndex<'a> {
+    bucket: usize,
+    marker: InvariantLifetime<'a>
+}
+
+impl<'a> BucketIndex<'a> {
+    #[inline]
+    pub fn new<K, V>(ti: &Snapshot<'a, K, V>, bucket: usize) -> Self {
+        BucketIndex {bucket: index_hash(ti, bucket), marker: InvariantLifetime::new() }
+    }
+}
+
+impl<'a> Deref for BucketIndex<'a> {
+    type Target = usize;
+
+    fn deref(&self) -> &usize {
+        &self.bucket
+    }
+}
+
+pub struct LockTwo<'a, K: 'a, V: 'a> {
+    ti: Snapshot<'a, K, V>,
+    i1: BucketIndex<'a>,
+    i2: BucketIndex<'a>,
 }
 
 impl<'a, K, V> LockTwo<'a, K, V> {
     /// Unsafe because it assumes that i1 and i2 are in bounds and locked.
-    pub unsafe fn new(ti: HazardPointerSet<'a, TableInfo<K, V>>, i1: usize, i2: usize) -> Self {
+    pub unsafe fn new(ti: Snapshot<'a, K, V>, i1: BucketIndex<'a>, i2: BucketIndex<'a>) -> Self {
         LockTwo { ti: ti, i1: i1, i2: i2 }
     }
 
     #[inline]
-    pub fn ti(&self) -> &TableInfo<K, V> {
+    pub fn ti(&self) -> &Snapshot<'a, K, V> {
         &self.ti
     }
 
     #[inline]
-    pub fn i1(&self) -> usize {
+    pub fn i1(&self) -> BucketIndex<'a> {
         self.i1
     }
 
     #[inline]
-    pub fn i2(&self) -> usize {
+    pub fn i2(&self) -> BucketIndex<'a> {
         self.i2
     }
 
@@ -462,73 +520,75 @@ impl<'a, K, V> LockTwo<'a, K, V> {
 
     pub fn bucket1(&mut self) -> (&mut Bucket<K, V>, &TableInfo<K, V>) {
         unsafe {
-            (&mut *self.ti.buckets.get_unchecked(self.i1).get(), &self.ti)
+            (&mut *self.ti.buckets.get_unchecked(*self.i1).get(), &self.ti)
         }
     }
 
     pub fn bucket2(&mut self) -> (&mut Bucket<K, V>, &TableInfo<K, V>) {
         unsafe {
-            (&mut *self.ti.buckets.get_unchecked(self.i2).get(), &self.ti)
+            (&mut *self.ti.buckets.get_unchecked(*self.i2).get(), &self.ti)
         }
     }
 }
 
 /// lock locks the given bucket index.
-///
-/// Unsafe because it assumes that i is in bounds.
 #[inline(always)]
-pub unsafe fn lock<K, V>(ti: &TableInfo<K, V>, i: usize) {
-    ti.locks.get_unchecked(lock_ind(i)).lock();
+pub fn lock<'a, K, V>(ti: &Snapshot<'a, K, V>, i: BucketIndex<'a>) {
+    unsafe {
+        ti.locks.get_unchecked(lock_ind(*i)).lock();
+    }
 }
 
 /// unlock unlocks the given bucket index.
 ///
-/// Unsafe because it assumes that i is in bounds and locked.
+/// Unsafe because it assumes that i is locked.
 #[inline(always)]
-pub unsafe fn unlock<K, V>(ti: &TableInfo<K, V>, i: usize) {
-    ti.locks.get_unchecked(lock_ind(i)).unlock();
+pub unsafe fn unlock<'a, K, V>(ti: &Snapshot<'a, K, V>, i: BucketIndex<'a>) {
+    ti.locks.get_unchecked(lock_ind(*i)).unlock();
 }
 
 /// lock_two locks the two bucket indexes, always locking the earlier index
 /// first to avoid deadlock. If the two indexes are the same, it just locks
 /// one.
-///
-/// Unsafe because it assumes that i1 and i2 are in bounds.
-pub unsafe fn lock_two<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize) {
-    let i1 = lock_ind(i1);
-    let i2 = lock_ind(i2);
-    let locks = &ti.locks;
-    match i1.cmp(&i2) {
-        Less => {
-            locks.get_unchecked(i1).lock();
-            locks.get_unchecked(i2).lock();
-        },
-        Greater => {
-            locks.get_unchecked(i2).lock();
-            locks.get_unchecked(i1).lock();
-        },
-        Equal => {
-            locks.get_unchecked(i1).lock()
-        },
+pub fn lock_two<'a, K, V>(ti: &Snapshot<'a, K, V>,
+                          i1: BucketIndex<'a>, i2: BucketIndex<'a>) {
+    unsafe {
+        let i1 = lock_ind(*i1);
+        let i2 = lock_ind(*i2);
+        let locks = &ti.locks;
+        match i1.cmp(&i2) {
+            Less => {
+                locks.get_unchecked(i1).lock();
+                locks.get_unchecked(i2).lock();
+            },
+            Greater => {
+                locks.get_unchecked(i2).lock();
+                locks.get_unchecked(i1).lock();
+            },
+            Equal => {
+                locks.get_unchecked(i1).lock()
+            },
+        }
+        /*if (i1 < i2) {
+            ti->locks_[i1].lock();
+            ti->locks_[i2].lock();
+        } else if (i2 < i1) {
+            ti->locks_[i2].lock();
+            ti->locks_[i1].lock();
+        } else {
+            ti->locks_[i1].lock();
+        }*/
     }
-    /*if (i1 < i2) {
-        ti->locks_[i1].lock();
-        ti->locks_[i2].lock();
-    } else if (i2 < i1) {
-        ti->locks_[i2].lock();
-        ti->locks_[i1].lock();
-    } else {
-        ti->locks_[i1].lock();
-    }*/
 }
 
 /// unlock_two unlocks both of the given bucket indexes, or only one if they
 /// are equal. Order doesn't matter here.
 ///
-/// Unsafe because it assumes that the locks are taken and i1 and i2 are in bounds.
-pub unsafe fn unlock_two<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize) {
-    let i1 = lock_ind(i1);
-    let i2 = lock_ind(i2);
+/// Unsafe because it assumes that the locks are taken.
+pub unsafe fn unlock_two<'a, K, V>(ti: &Snapshot<'a, K, V>,
+                                   i1: BucketIndex<'a>, i2: BucketIndex<'a>) {
+    let i1 = lock_ind(*i1);
+    let i2 = lock_ind(*i2);
     let locks = &ti.locks;
     locks.get_unchecked(i1).unlock();
     if i1 != i2 {
@@ -537,96 +597,99 @@ pub unsafe fn unlock_two<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize) {
 }
 
 /// lock_three locks the three bucket indexes in numerical order.
-///
-/// Unsafe because it assumes that i1, i2, and i3 are in bounds.
-pub unsafe fn lock_three<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize, i3: usize) {
-    let i1 = lock_ind(i1);
-    let i2 = lock_ind(i2);
-    let i3 = lock_ind(i3);
-    /*let locks = &ti.locks;
-    match (i1.cmp(i2), i2.cmp(i3), i1.cmp(i3)) {
+pub fn lock_three<'a, K, V>(ti: &Snapshot<'a, K, V>,
+                            b1: BucketIndex<'a>, b2: BucketIndex<'a>, b3: BucketIndex<'a>) {
+    unsafe {
+        let i1 = lock_ind(*b1);
+        let i2 = lock_ind(*b2);
+        let i3 = lock_ind(*b3);
+        /*let locks = &ti.locks;
+        match (i1.cmp(i2), i2.cmp(i3), i1.cmp(i3)) {
+            // If any are the same, we just run lock_two
+            (Equal, _, _) | (_, Equal, _) => lock_two(ti, i1, i3),
+            (_, _, Equal) => lock_two(ti, i1, i2),
+            (Less, Less, /*Less - if Greater something is wrong.*/_) =>  {
+                locks.get_unchecked(i1).lock();
+                locks.get_unchecked(i2).lock();
+                locks.get_unchecked(i3).lock();
+            },
+            (Less, /*Greater*/_, Less) => {
+                locks.get_unchecked(i1).lock();
+                locks.get_unchecked(i3).lock();
+                locks.get_unchecked(i2).lock();
+            },
+            (Less, /*Greater*/_, /*Greater*/_) => {
+                locks.get_unchecked(i3).lock();
+                locks.get_unchecked(i1).lock();
+                locks.get_unchecked(i2).lock();
+            },
+            (/*Greater*/_, Less, Less) => {
+                locks.get_unchecked(i2).lock();
+                locks.get_unchecked(i1).lock();
+                locks.get_unchecked(i3).lock();
+            },
+            (/*Greater*/_, Less, /*Greater*/_) => {
+                locks.get_unchecked(i2).lock();
+                locks.get_unchecked(i3).lock();
+                locks.get_unchecked(i1).lock();
+            },
+            _/*(Greater, Greater, Greater)*/ => {
+                locks.get_unchecked(i3).lock();
+                locks.get_unchecked(i2).lock();
+                locks.get_unchecked(i1).lock();
+            },
+        }*/
         // If any are the same, we just run lock_two
-        (Equal, _, _) | (_, Equal, _) => lock_two(ti, i1, i3),
-        (_, _, Equal) => lock_two(ti, i1, i2),
-        (Less, Less, /*Less - if Greater something is wrong.*/_) =>  {
-            locks.get_unchecked(i1).lock();
-            locks.get_unchecked(i2).lock();
-            locks.get_unchecked(i3).lock();
-        },
-        (Less, /*Greater*/_, Less) => {
-            locks.get_unchecked(i1).lock();
-            locks.get_unchecked(i3).lock();
-            locks.get_unchecked(i2).lock();
-        },
-        (Less, /*Greater*/_, /*Greater*/_) => {
-            locks.get_unchecked(i3).lock();
-            locks.get_unchecked(i1).lock();
-            locks.get_unchecked(i2).lock();
-        },
-        (/*Greater*/_, Less, Less) => {
-            locks.get_unchecked(i2).lock();
-            locks.get_unchecked(i1).lock();
-            locks.get_unchecked(i3).lock();
-        },
-        (/*Greater*/_, Less, /*Greater*/_) => {
-            locks.get_unchecked(i2).lock();
-            locks.get_unchecked(i3).lock();
-            locks.get_unchecked(i1).lock();
-        },
-        _/*(Greater, Greater, Greater)*/ => {
-            locks.get_unchecked(i3).lock();
-            locks.get_unchecked(i2).lock();
-            locks.get_unchecked(i1).lock();
-        },
-    }*/
-    // If any are the same, we just run lock_two
-    if i1 == i2 {
-        lock_two(ti, i1, i3);
-    } else if i2 == i3 {
-        lock_two(ti, i1, i3);
-    } else if i1 == i3 {
-        lock_two(ti, i1, i2);
-    } else {
-        let locks = &ti.locks;
-        if i1 < i2 {
-            if i2 < i3 {
-                locks.get_unchecked(i1).lock();
-                locks.get_unchecked(i2).lock();
-                locks.get_unchecked(i3).lock();
-            } else if i1 < i3 {
-                locks.get_unchecked(i1).lock();
-                locks.get_unchecked(i3).lock();
-                locks.get_unchecked(i2).lock();
-            } else {
-                locks.get_unchecked(i3).lock();
-                locks.get_unchecked(i1).lock();
-                locks.get_unchecked(i2).lock();
-            }
-        } else if i2 < i3 {
-            if i1 < i3 {
-                locks.get_unchecked(i2).lock();
-                locks.get_unchecked(i1).lock();
-                locks.get_unchecked(i3).lock();
-            } else {
-                locks.get_unchecked(i2).lock();
-                locks.get_unchecked(i3).lock();
-                locks.get_unchecked(i1).lock();
-            }
+        if i1 == i2 {
+            lock_two(ti, b1, b3);
+        } else if i2 == i3 {
+            lock_two(ti, b1, b3);
+        } else if i1 == i3 {
+            lock_two(ti, b1, b2);
         } else {
-            locks.get_unchecked(i3).lock();
-            locks.get_unchecked(i2).lock();
-            locks.get_unchecked(i1).lock();
+            let locks = &ti.locks;
+            if i1 < i2 {
+                if i2 < i3 {
+                    locks.get_unchecked(i1).lock();
+                    locks.get_unchecked(i2).lock();
+                    locks.get_unchecked(i3).lock();
+                } else if i1 < i3 {
+                    locks.get_unchecked(i1).lock();
+                    locks.get_unchecked(i3).lock();
+                    locks.get_unchecked(i2).lock();
+                } else {
+                    locks.get_unchecked(i3).lock();
+                    locks.get_unchecked(i1).lock();
+                    locks.get_unchecked(i2).lock();
+                }
+            } else if i2 < i3 {
+                if i1 < i3 {
+                    locks.get_unchecked(i2).lock();
+                    locks.get_unchecked(i1).lock();
+                    locks.get_unchecked(i3).lock();
+                } else {
+                    locks.get_unchecked(i2).lock();
+                    locks.get_unchecked(i3).lock();
+                    locks.get_unchecked(i1).lock();
+                }
+            } else {
+                locks.get_unchecked(i3).lock();
+                locks.get_unchecked(i2).lock();
+                locks.get_unchecked(i1).lock();
+            }
         }
     }
 }
 
 /// unlock_three unlocks the three given buckets
 ///
-/// Unsafe because it assumes that i1, i2, and i3 are in bounds, and all the locks are taken.
-pub unsafe fn unlock_three<K, V>(ti: &TableInfo<K, V>, i1: usize, i2: usize, i3: usize) {
-    let i1 = lock_ind(i1);
-    let i2 = lock_ind(i2);
-    let i3 = lock_ind(i3);
+/// Unsafe because it assumes that all the locks are taken.
+pub unsafe fn unlock_three<'a, K, V>(ti: &Snapshot<'a, K, V>,
+                                     i1: BucketIndex<'a>, i2: BucketIndex<'a>, i3: BucketIndex<'a>)
+{
+    let i1 = lock_ind(*i1);
+    let i2 = lock_ind(*i2);
+    let i3 = lock_ind(*i3);
     let locks = &ti.locks;
     locks.get_unchecked(i1).unlock();
     if i2 != i1 {
@@ -667,6 +730,15 @@ pub fn lock_ind(bucket_ind: usize) -> usize {
     bucket_ind & (K_NUM_LOCKS - 1)
 }
 
+/// hashmask returns the bitmask for the buckets array corresponding to a
+/// given hashpower.
+#[inline(always)]
+fn hashmask(hashpower: usize) -> usize {
+    // Subtract is always safe because hashsize() always returns a positive value.
+    hashsize(hashpower).wrapping_sub(1)
+}
+
+
 /// hashsize returns the number of buckets corresponding to a given
 /// hashpower.
 /// Invariant: always returns a nonzero value.
@@ -674,4 +746,11 @@ pub fn lock_ind(bucket_ind: usize) -> usize {
 pub fn hashsize(hashpower: usize) -> usize {
     // TODO: make sure Rust can't UB on too large inputs or we'll make this unsafe.
     1 << hashpower
+}
+
+/// index_hash returns the first possible bucket that the given hashed key
+/// could be.
+#[inline(always)]
+fn index_hash<'a, K, V>(ti: &TableInfo<K, V>, hv: usize) -> usize {
+    hv & hashmask(ti.hashpower)
 }
