@@ -197,7 +197,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     pub fn insert(&self, key: K, v: V) -> InsertResult<(), K, V> where
             K: Copy + Send + Sync,
             V: Send + Sync,
-            S: Default + Send + Sync,
+            S: Clone + Send + Sync,
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, &key);
@@ -263,7 +263,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     pub fn upsert<F, T>(&self, mut key: K, mut updater: F, mut val: V) -> Option<T> where
             K: Copy + Send + Sync,
             V: Send + Sync,
-            S: Default + Send + Sync,
+            S: Clone + Send + Sync,
             F: FnMut(&mut V) -> T,
     {
         let hazard_pointer = check_hazard_pointer();
@@ -304,7 +304,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     pub fn rehash(&self, n: usize) -> Result<(), ()>  where
             K: Copy + Send + Sync,
             V: Send + Sync,
-            S: Default + Send + Sync,
+            S: Clone + Send + Sync,
     {
         let hazard_pointer = check_hazard_pointer();
         let ti = self.snapshot_table_nolock(&hazard_pointer);
@@ -324,7 +324,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     pub fn reserve(&self, n: usize) -> Result<(), ()> where
             K: Copy + Send + Sync,
             V: Send + Sync,
-            S: Default + Send + Sync,
+            S: Clone + Send + Sync,
     {
         let hazard_pointer = check_hazard_pointer();
         let ti = self.snapshot_table_nolock(&hazard_pointer);
@@ -745,7 +745,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                                      -> InsertResult<(), K, V> where
             K: Copy + Send + Sync,
             V: Send + Sync,
-            S: Default + Send + Sync,
+            S: Clone + Send + Sync,
     {
         // TODO: investigate this claim:
         //   "by the end of the function, the hazard pointer will have been unset."
@@ -791,7 +791,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                                    n: usize) -> Result<(), ()> where
             K: Copy + Send + Sync,
             V: Send + Sync,
-            S: Default + Send + Sync,
+            S: Clone + Send + Sync,
     {
         struct TI<'a, K, V>(&'a TableInfo<K, V>) where K: 'a, V: 'a;
         unsafe impl<'a, K, V> Send for TI<'a, K, V> where K: Send, V: Send {}
@@ -811,7 +811,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                                                   end: usize) where
                 K: Copy + Eq + Hash + Send + Sync,
                 V: Send + Sync,
-                S: Default + HashState + Send + Sync,
+                S: Clone + HashState + Send + Sync,
         {
         //let ref insert_into_table = |new_map: &CuckooHashMap<K, V, S>,
         //                             TI(old_ti): TI<K, V>,
@@ -856,8 +856,10 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                                                  end: usize) -> Res<'a> where
                 K: Copy + Eq + Hash + Send + Sync,
                 V: Send + Sync,
-                S: Default + HashState + Send + Sync,
+                S: Clone + HashState + Send + Sync,
         {
+            // FIXME: Properly insert an extra hazard pointer to keep the current one from being
+            // blown away by the insert.
             insert_into_table_(new_map, ti, i, end);
         }
         #[cfg(not(feature="nothreads"))]
@@ -868,7 +870,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                                                  end: usize) -> Res<'a> where
                 K: Copy + Eq + Hash + Send + Sync,
                 V: Send + Sync,
-                S: Default + HashState + Send + Sync,
+                S: Clone + HashState + Send + Sync,
         {
             thread::scoped(move || insert_into_table_(new_map, ti, i, end) )
         }
@@ -893,7 +895,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
 
             let ref new_map = Self::with_capacity_and_hash_state(
                 table_info::hashsize(n).wrapping_mul(SLOT_PER_BUCKET),
-                Default::default());
+                self.hash_state.clone());
             //let threadnum = num_cpus::get();
             let threadnum = ti.num_inserts.len();
             if threadnum == 0 {
