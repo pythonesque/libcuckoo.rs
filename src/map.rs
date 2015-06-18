@@ -12,7 +12,7 @@ use std::thread;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use super::iter::Range;
 use super::hazard_pointer::{check_hazard_pointer, delete_unused, HazardPointer, HazardPointerSet};
-use super::table_info::{self, AllUnlocker, Bucket, BucketIndex, LockTwo, SlotIndex, SlotIndexIter, SLOT_PER_BUCKET, Snapshot, TableInfo};
+use super::table_info::{self, AllUnlocker, Bucket, BucketIndex, CounterIndex, LockTwo, SlotIndex, SlotIndexIter, SLOT_PER_BUCKET, Snapshot, TableInfo};
 
 /// DEFAULT_SIZE is the default number of elements in an empty hash
 /// table
@@ -202,10 +202,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, &key);
         self.snapshot_and_lock_two(&hazard_pointer, hv, |snapshot, lock| {
-            unsafe {
-                table_info::check_counterid();
-                self.cuckoo_insert_loop(&hazard_pointer, key, v, hv, (snapshot, lock))
-            }
+            self.cuckoo_insert_loop(&hazard_pointer, key, v, hv, (snapshot, lock))
         })
     }
 
@@ -216,10 +213,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         self.snapshot_and_lock_two(&hazard_pointer, hv, move |snapshot, mut lock| {
-            let result = unsafe {
-                table_info::check_counterid();
-                cuckoo_delete(key, hv, &snapshot, &mut lock)
-            };
+            let result = cuckoo_delete(key, hv, &snapshot, &mut lock);
             lock.release(&snapshot);
             result
         })
@@ -278,17 +272,14 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                         return Ok(v);
                     },
                     // We run an insert, since the update failed
-                    None => unsafe {
-                        table_info::check_counterid();
-                        match self.cuckoo_insert_loop(hazard_pointer, key, val, hv,
-                                                      (snapshot, lock)) {
-                            Ok(()) => return Ok(None),
-                            // The only valid reason for res being false is if insert
-                            // encountered a duplicate key after releasing the locks and
-                            // performing cuckoo hashing. In this case, we retry the entire
-                            // upsert operation.
-                            Err(e) => return Err(e),
-                        }
+                    None => return match self.cuckoo_insert_loop(hazard_pointer, key, val, hv,
+                                                                 (snapshot, lock)) {
+                        Ok(()) => Ok(None),
+                        // The only valid reason for res being false is if insert
+                        // encountered a duplicate key after releasing the locks and
+                        // performing cuckoo hashing. In this case, we retry the entire
+                        // upsert operation.
+                        Err(e) => Err(e),
                     }
                 }
             }) {
@@ -676,20 +667,18 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// inserting, it checks that the key isn't already in the table. cuckoo
     /// hashing presents multiple concurrency issues, which are explained in the
     /// function.
-    ///
-    /// Unsafe because (with counter enabled) it assumes that the counter has been checked and is in
-    /// bounds.
-    unsafe fn cuckoo_insert<'a>(&self,
-                                key: K, val: V,
-                                hv: usize,
-                                snapshot_lock: (Snapshot<'a, K, V>, LockTwo<'a>))
-                                -> InsertResult<(), K, V> where
+    fn cuckoo_insert<'a>(&self,
+                         key: K, val: V,
+                         hv: usize,
+                         snapshot_lock: (Snapshot<'a, K, V>, LockTwo<'a>))
+                         -> InsertResult<(), K, V> where
             K: Copy + Eq,
     {
         let snapshot = &snapshot_lock.0;
         let mut lock = snapshot_lock.1;
         //const partial_t partial = partial_key(hv);
         let partial = ();
+        let counterid = table_info::check_counterid(&snapshot_lock.0);
         match try_find_insert_bucket(partial, &key, lock.bucket1(snapshot)) {
             Err(KeyDuplicated) => {
                 lock.release(snapshot);
@@ -702,12 +691,12 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 },
                 res2 => {
                     if let Ok(res1) = res1 {
-                        add_to_bucket(snapshot, partial, key, val, lock.bucket1(snapshot), res1);
+                        add_to_bucket(snapshot, &counterid, partial, key, val, lock.bucket1(snapshot), res1);
                         lock.release(snapshot);
                         return Ok(());
                     }
                     if let Ok(res2) = res2 {
-                        add_to_bucket(snapshot, partial, key, val, lock.bucket2(snapshot), res2);
+                        add_to_bucket(snapshot, &counterid, partial, key, val, lock.bucket2(snapshot), res2);
                         lock.release(snapshot);
                         return Ok(());
                     }
@@ -715,37 +704,39 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             }
         }
         // we are unlucky, so let's perform cuckoo hashing
-        match self.run_cuckoo(snapshot, lock.i1, lock.i2) {
-            Err(CuckooError::UnderExpansion) => {
-                // The run_cuckoo operation operated on an old version of the table,
-                // so we have to try again. We signal to the calling insert method
-                // to try again by returning failure_under_expansion.
-                Err((UnderExpansion, key, val))
-            },
-            Ok((insert_bucket, insert_slot)) => {
-                /*debug_assert!(!ti.locks.get_unchecked(lock_ind(i1)).try_lock());
-                debug_assert!(!ti.locks.get_unchecked(lock_ind(i2)).try_lock());
-                debug_assert!(!ti.buckets.get_unchecked(insert_bucket).occupied(insert_slot));
-                debug_assert!(insert_bucket == index_hash(ti, hv) ||
-                              insert_bucket == alt_index(ti, hv, index_hash(ti, hv)));*/
-                // Since we unlocked the buckets during run_cuckoo, another insert
-                // could have inserted the same key into either i1 or i2, so we
-                // check for that before doing the insert.
-                if cuckoo_contains(&key, hv, snapshot, &mut lock) {
+        unsafe {
+            match self.run_cuckoo(snapshot, lock.i1, lock.i2) {
+                Err(CuckooError::UnderExpansion) => {
+                    // The run_cuckoo operation operated on an old version of the table,
+                    // so we have to try again. We signal to the calling insert method
+                    // to try again by returning failure_under_expansion.
+                    Err((UnderExpansion, key, val))
+                },
+                Ok((insert_bucket, insert_slot)) => {
+                    /*debug_assert!(!ti.locks.get_unchecked(lock_ind(i1)).try_lock());
+                    debug_assert!(!ti.locks.get_unchecked(lock_ind(i2)).try_lock());
+                    debug_assert!(!ti.buckets.get_unchecked(insert_bucket).occupied(insert_slot));
+                    debug_assert!(insert_bucket == index_hash(ti, hv) ||
+                                  insert_bucket == alt_index(ti, hv, index_hash(ti, hv)));*/
+                    // Since we unlocked the buckets during run_cuckoo, another insert
+                    // could have inserted the same key into either i1 or i2, so we
+                    // check for that before doing the insert.
+                    if cuckoo_contains(&key, hv, snapshot, &mut lock) {
+                        lock.release(snapshot);
+                        return Err((KeyDuplicated, key, val));
+                    }
+                    add_to_bucket(snapshot, &counterid, partial, key, val,
+                                  insert_bucket, insert_slot);
                     lock.release(snapshot);
-                    return Err((KeyDuplicated, key, val));
+                    Ok(())
+                },
+                Err(CuckooError::TableFull) => {
+                    // assert(st == failure);
+                    //LIBCUCKOO_DBG("hash table is full (hashpower = %zu, hash_items = %zu,"
+                    //              "load factor = %.2f), need to increase hashpower\n",
+                    //              ti->hashpower_, cuckoo_size(ti), cuckoo_loadfactor(ti));
+                    Err((TableFull, key, val))
                 }
-                add_to_bucket(snapshot, partial, key, val,
-                              insert_bucket, insert_slot);
-                lock.release(snapshot);
-                Ok(())
-            },
-            Err(CuckooError::TableFull) => {
-                // assert(st == failure);
-                //LIBCUCKOO_DBG("hash table is full (hashpower = %zu, hash_items = %zu,"
-                //              "load factor = %.2f), need to increase hashpower\n",
-                //              ti->hashpower_, cuckoo_size(ti), cuckoo_loadfactor(ti));
-                Err((TableFull, key, val))
             }
         }
     }
@@ -753,14 +744,11 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// We run cuckoo_insert in a loop until it succeeds in insert and upsert, so
     /// we pulled out the loop to avoid duplicating it. This should be called
     /// directly after snapshot_and_lock_two.
-    ///
-    /// Unsafe because (with counter enabled) it assumes that the counter has been checked and is in
-    /// bounds.
-    unsafe fn cuckoo_insert_loop<'a>(&self, hazard_pointer: &HazardPointer,
-                                     mut key: K, mut val: V,
-                                     hv: usize,
-                                     mut snapshot_lock: (Snapshot<'a, K, V>, LockTwo<'a>))
-                                     -> InsertResult<(), K, V> where
+    fn cuckoo_insert_loop<'a>(&self, hazard_pointer: &HazardPointer,
+                              mut key: K, mut val: V,
+                              hv: usize,
+                              mut snapshot_lock: (Snapshot<'a, K, V>, LockTwo<'a>))
+                              -> InsertResult<(), K, V> where
             K: Copy + Send + Sync,
             V: Send + Sync,
             S: Clone + Send + Sync,
@@ -783,7 +771,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                     let hashpower = hashpower.checked_add(1)
                                              .unwrap_or_else( || {
                         //println!("capacity error: off by one in cuckoo_insert_loop");
-                        intrinsics::abort()
+                        unsafe { intrinsics::abort() }
                     });
                     if let Err(()) =
                         self.cuckoo_expand_simple(hazard_pointer, hashpower) {
@@ -796,7 +784,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             key = key_;
             val = val_;
             snapshot_lock = self.snapshot_and_lock_two(hazard_pointer,
-                                                       hv, |snapshot_, lock_| {
+                                                       hv, |snapshot_, lock_| unsafe {
                 // This is safe because ti was moved into cuckoo_insert_loop, so it can't be relied
                 // on outside of this function anyway, and there are no locals within this function
                 // that outlast the loop body and depend on the snapshot remaining the same.
@@ -1290,13 +1278,11 @@ fn check_in_bucket<K, V, P>(_partial: P, key: &K, bucket: &Bucket<K, V>) -> bool
 }
 
 /// add_to_bucket will insert the given key-value pair into the slot.
-///
-/// Unsafe because (with counter enabled) it assumes that the counter has been checked and is in
-/// bounds.
-unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>,
-                                 _partial: P,
-                                 key: K, val: V,
-                                 bucket: &mut Bucket<K, V>, j: SlotIndex) where
+fn add_to_bucket<'a, K, V, P>(ti: &Snapshot<'a, K, V>,
+                              counterid: &CounterIndex<'a>,
+                              _partial: P,
+                              key: K, val: V,
+                              bucket: &mut Bucket<K, V>, j: SlotIndex) where
         K: Copy + Eq,
         /*K: fmt::Debug,*/
         /*V: fmt::Debug,*/
@@ -1306,20 +1292,17 @@ unsafe fn add_to_bucket<K, V, P>(ti: &TableInfo<K, V>,
     //if (!is_simple) {
     //    ti->buckets_[i].partial(j) = partial;
     //}
-    // &mut should be safe; this function is potected by the lock.
+    // &mut should be safe; this function is protected by the lock.
     bucket.set_kv(j, key, val);
     #[inline(always)]
     #[cfg(feature = "counter")]
-    /// Unsafe because it assumes the counter has been checked and is in bounds.
-    unsafe fn insert_counter<K, V>(ti: &TableInfo<K, V>) {
-        let counterid = (*table_info::COUNTER_ID.0.get())
-            .unwrap_or_else( || intrinsics::unreachable() );
-        let num_inserts = ti.num_inserts.get_unchecked(counterid);
+    fn insert_counter<'a, K, V>(ti: &Snapshot<'a, K, V>, counterid: &CounterIndex<'a>) {
+        let num_inserts = unsafe { ti.num_inserts.get_unchecked(counterid.index) };
         num_inserts.fetch_add_relaxed(1);
     }
     #[cfg(not(feature = "counter"))]
-    fn insert_counter<K, V>(_: &TableInfo<K, V>) {}
-    insert_counter(ti);
+    fn insert_counter<'a, K, V>(_: &Snapshot<'a, K, V>, _: &CounterIndex<'a>) {}
+    insert_counter(ti, counterid);
 }
 
 /// try_find_insert_bucket will search the bucket and store the index of an
@@ -1354,14 +1337,12 @@ fn try_find_insert_bucket<K, V, P>(_partial: P,
 }
 /// try_del_from_bucket will search the bucket for the given key, and set the
 /// slot of the key to empty if it finds it.
-///
-/// Unsafe because (with counter enabled) it assumes that the counter has been checked and is in
-/// bounds.
-unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>,
-                                       _partial: P,
-                                       key: &K,
-                                       bucket: &mut Bucket<K, V>)
-                                       -> Option<V> where
+fn try_del_from_bucket<'a, K, V, P>(ti: &Snapshot<'a, K, V>,
+                                    counterid: &CounterIndex<'a>,
+                                    _partial: P,
+                                    key: &K,
+                                    bucket: &mut Bucket<K, V>)
+                                    -> Option<V> where
         K: Eq,
 {
     for mut slot in bucket.slots_mut() {
@@ -1371,18 +1352,15 @@ unsafe fn try_del_from_bucket<K, V, P>(ti: &TableInfo<K, V>,
         // }
         #[inline(always)]
         #[cfg(feature = "counter")]
-        /// Unsafe because it assumes the counter has been checked and is in bounds.
-        unsafe fn delete_counter<K, V>(ti: &TableInfo<K, V>) {
-            let counterid = (*table_info::COUNTER_ID.0.get())
-                .unwrap_or_else( || intrinsics::unreachable() );
-            let num_deletes = ti.num_deletes.get_unchecked(counterid);
+        fn delete_counter<'a, K, V>(ti: &Snapshot<'a, K, V>, counterid: &CounterIndex<'a>) {
+            let num_deletes = unsafe { ti.num_deletes.get_unchecked(counterid.index) };
             num_deletes.fetch_add_relaxed(1);
         }
         #[cfg(not(feature = "counter"))]
-        fn delete_counter<K, V>(_: &TableInfo<K, V>) {}
+        fn delete_counter<'a, K, V>(_: &Snapshot<'a, K, V>, _: &CounterIndex<'a>) {}
         if slot.key() == key {
             let (_, v) = slot.erase();
-            delete_counter(ti);
+            delete_counter(ti, counterid);
             return Some(v);
         }
     }
@@ -1461,21 +1439,19 @@ fn cuckoo_contains<'a, K, V>(key: &K, _hv: usize,
 /// cuckoo_delete searches the table for the given key and sets the slot with
 /// that key to empty if it finds it. It expects the locks to be taken and
 /// released outside the function.
-///
-/// Unsafe because (with counter enabled) it assumes that the counter has been checked and is in
-/// bounds.
-unsafe fn cuckoo_delete<'a, K, V>(key: &K,
-                                  _hv: usize,
-                                  snapshot: &Snapshot<'a, K, V>,
-                                  lock: &mut LockTwo<'a>) -> Option<V> where
+fn cuckoo_delete<'a, K, V>(key: &K,
+                           _hv: usize,
+                           snapshot: &Snapshot<'a, K, V>,
+                           lock: &mut LockTwo<'a>) -> Option<V> where
         K: Eq,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    let res = try_del_from_bucket(snapshot, partial, key, lock.bucket1(snapshot));
+    let counterid = table_info::check_counterid(&snapshot);
+    let res = try_del_from_bucket(snapshot, &counterid, partial, key, lock.bucket1(snapshot));
     match res {
         v @ Some(_) => v,
-        None => try_del_from_bucket(snapshot, partial, key, lock.bucket2(snapshot))
+        None => try_del_from_bucket(snapshot, &counterid, partial, key, lock.bucket2(snapshot))
     }
 }
 

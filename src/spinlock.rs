@@ -85,6 +85,7 @@ impl SpinLock {
         self.tas()
     }
 
+    #[inline]
     pub const fn new() -> Self {
         SpinLock { lock: UnsafeCell::new(0), padding: [] }
     }

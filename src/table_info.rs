@@ -1,5 +1,7 @@
 use num_cpus;
 use std::cell::UnsafeCell;
+#[cfg(feature = "counter")]
+use std::cell::Cell;
 use std::cmp::Ordering::{Less, Greater, Equal};
 use std::intrinsics;
 use std::marker::PhantomData;
@@ -329,13 +331,22 @@ impl CacheInt {
     }
 }
 
-pub struct Counter(pub UnsafeCell<Option<usize>>);
+#[cfg(feature = "counter")]
+struct Counter(Cell<Option<usize>>);
 
+#[cfg(feature = "counter")]
 unsafe impl Sync for Counter {}
+
+/// When set, guaranteed to be set and in bounds for the snapshot with the same lifetime.
+pub struct CounterIndex<'a> {
+    #[cfg(feature = "counter")]
+    pub index: usize,
+    marker: InvariantLifetime<'a>,
+}
 
 /// counterid stores the per-thread counter index of each thread.
 #[cfg(feature = "counter")]
-#[thread_local] pub static COUNTER_ID: Counter = Counter(UnsafeCell::new(None));
+#[thread_local] static COUNTER_ID: Counter = Counter(Cell::new(None));
 
 /// check_counterid checks if the counterid has already been determined. If
 /// not, it assigns a counterid to the current thread by picking a random
@@ -343,16 +354,29 @@ unsafe impl Sync for Counter {}
 /// the number of elements in the table.
 #[inline(always)]
 #[cfg(feature = "counter")]
-pub fn check_counterid() {
-    unsafe {
-        let counterid = COUNTER_ID.0.get();
-        if (*counterid).is_none() {
-            *counterid = Some(cpuid() as usize);
-        };
+pub fn check_counterid<'a, K, V>(ti: &Snapshot<'a, K, V>) -> CounterIndex<'a> {
+    let Counter(ref counterid) = COUNTER_ID;
+    let counterid = match counterid.get() {
+        Some(counterid) => counterid,
+        None => {
+            let id = cpuid() as usize;
+            counterid.set(Some(id));
+            id
+        }
+    };
+    // `num_inserts.len()` and `num_deletes.len()` should be identical.
+    // Note that the check probably isn't *really* necessary.  Actually, I'm kind of tempted
+    // to remove it, since if it goes wrong num_cpus or cpuid is screwy, but considering that
+    // this code path is off by default I will leave it in for now.
+    CounterIndex {
+        index: if counterid > ti.num_inserts.len() { 0 } else { counterid },
+        marker: InvariantLifetime::new(),
     }
 }
 #[cfg(not(feature = "counter"))]
-pub fn check_counterid() {}
+pub fn check_counterid<'a, K, V>(_: &Snapshot<'a, K, V>) -> CounterIndex<'a> {
+    CounterIndex { marker: InvariantLifetime::new() }
+}
 
 /// TableInfo contains the entire state of the hashtable. We allocate one
 /// TableInfo pointer per hash table and store all of the table memory in it,
@@ -408,6 +432,11 @@ impl<K, V> TableInfo<K, V> {
         }
         let num_cpus = num_cpus::get();
 
+        // Pretty sure this should actually be impossible, but check anyway to be extra sure.
+        if num_cpus == 0 {
+            unsafe { intrinsics::abort(); }
+        }
+
         unsafe {
             let ti = box UnsafeCell {
                 value: TableInfo {
@@ -428,11 +457,12 @@ impl<K, V> TableInfo<K, V> {
 
 #[allow(raw_pointer_derive)]
 #[derive(Clone,Copy)]
-pub struct InvariantLifetime<'id>(
+struct InvariantLifetime<'id>(
     PhantomData<*mut &'id ()>);
 
 impl<'id> InvariantLifetime<'id> {
-    pub fn new() -> InvariantLifetime<'id> {
+    #[inline]
+    fn new() -> InvariantLifetime<'id> {
         InvariantLifetime(PhantomData)
     }
 }
