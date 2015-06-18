@@ -421,8 +421,7 @@ impl<K, V> TableInfo<K, V> {
                 let mut ptr = vec.as_mut_ptr();
                 let end = ptr.offset(n as isize);
                 while ptr != end {
-                    let t = f();
-                    ptr::write(ptr, t);
+                    ptr::write(ptr, f());
                     ptr = ptr.offset(1);
                 }
                 //mem::forget(element);
