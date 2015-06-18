@@ -107,6 +107,8 @@ fn main() {
     //let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::default();
     const CAPACITY: usize = 1 << 22;
     type Key = u64;//u32;//();
+    type MapKey = u64;
+    #[inline(always)] const fn map_key(key: Key) -> MapKey { key }
     type Val = bool;//[[u64; 8]; 16];//();
     const RED: Val = false;//[[0 ; 8]; 16];//();
     const BLACK: Val = true;//[[!0 ; 8]; 16];//();
@@ -179,6 +181,7 @@ fn main() {
         let mut reads: Key = 0;
         /*'here: */for j in range {
             for i in Range::new(j * MAX, (j + 1) * MAX) {
+                let i = map_key(i);
                 upserts = upserts.wrapping_add(1);
                 if let None = map.upsert(i, |b| { *b = RED; }, BLACK) {
                     continue;
@@ -201,6 +204,7 @@ fn main() {
         let mut deletes: Key = 0;
         let mut reads: Key = 0;
         for i in Range::new(j * MAX, (j + 1) * MAX) {
+            let i = map_key(i);
             //if map.erase(&i) != Some(RED) {
             if let None = map.erase(&i) {
                 //println!("delete error");
@@ -222,6 +226,7 @@ fn main() {
     let insert = |j: Key, stats: &mut Stats<Key>| {
         let mut inserts: Key = 0;
         for i in Range::new(j * MAX, (j + 1) * MAX) {
+            let i = map_key(i);
             if let Err(_) = map.insert(i, BLACK) {
                 //println!("insert error");
                 unsafe { intrinsics::abort(); }
@@ -235,6 +240,7 @@ fn main() {
     let update = |j: Key, stats: &mut Stats<Key>| {
         let mut updates: Key = 0;
         for i in Range::new(j * MAX, (j + 1) * MAX) {
+            let i = map_key(i);
             if map.update(&i, RED) != Ok(BLACK) {
                 //println!("update error");
                 unsafe { intrinsics::abort(); }
@@ -255,6 +261,7 @@ fn main() {
         /*'here: */for j in range {
             for _ in Range::new(0, NUM_READS) {
                 for i in Range::new(j * MAX, (j + 1) * MAX) {
+                    let i = map_key(i);
                     if map.find(&i) != Some(RED) {
                         //println!("find error");
                         unsafe { intrinsics::abort(); }
