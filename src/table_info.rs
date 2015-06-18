@@ -340,7 +340,7 @@ unsafe impl Sync for Counter {}
 /// When set, guaranteed to be set and in bounds for the snapshot with the same lifetime.
 pub struct CounterIndex<'a> {
     #[cfg(feature = "counter")]
-    pub index: usize,
+    index: usize,
     marker: InvariantLifetime<'a>,
 }
 
@@ -515,8 +515,8 @@ impl<'a> Deref for BucketIndex<'a> {
 }
 
 pub struct LockTwo<'a> {
-    pub i1: BucketIndex<'a>,
-    pub i2: BucketIndex<'a>,
+    i1: BucketIndex<'a>,
+    i2: BucketIndex<'a>,
     dummy: (),
 }
 
@@ -525,6 +525,14 @@ impl<'a> LockTwo<'a> {
     #[inline]
     pub unsafe fn new(i1: BucketIndex<'a>, i2: BucketIndex<'a>) -> Self {
         LockTwo { i1: i1, i2: i2, dummy: () }
+    }
+
+    pub fn i1(&self) -> BucketIndex<'a> {
+        self.i1
+    }
+
+    pub fn i2(&self) -> BucketIndex<'a> {
+        self.i2
     }
 
     pub fn release<K, V>(self, ti: &Snapshot<'a, K, V>) {

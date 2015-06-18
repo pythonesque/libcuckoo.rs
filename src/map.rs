@@ -705,7 +705,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         }
         // we are unlucky, so let's perform cuckoo hashing
         unsafe {
-            match self.run_cuckoo(snapshot, lock.i1, lock.i2) {
+            match self.run_cuckoo(snapshot, lock.i1(), lock.i2()) {
                 Err(CuckooError::UnderExpansion) => {
                     // The run_cuckoo operation operated on an old version of the table,
                     // so we have to try again. We signal to the calling insert method
