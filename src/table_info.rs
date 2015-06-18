@@ -485,48 +485,34 @@ impl<'a> Deref for BucketIndex<'a> {
     }
 }
 
-pub struct LockTwo<'a, K: 'a, V: 'a> {
-    ti: Snapshot<'a, K, V>,
-    i1: BucketIndex<'a>,
-    i2: BucketIndex<'a>,
+pub struct LockTwo<'a> {
+    pub i1: BucketIndex<'a>,
+    pub i2: BucketIndex<'a>,
+    dummy: (),
 }
 
-impl<'a, K, V> LockTwo<'a, K, V> {
+impl<'a> LockTwo<'a> {
     /// Unsafe because it assumes that i1 and i2 are in bounds and locked.
-    pub unsafe fn new(ti: Snapshot<'a, K, V>, i1: BucketIndex<'a>, i2: BucketIndex<'a>) -> Self {
-        LockTwo { ti: ti, i1: i1, i2: i2 }
-    }
-
     #[inline]
-    pub fn ti(&self) -> &Snapshot<'a, K, V> {
-        &self.ti
+    pub unsafe fn new(i1: BucketIndex<'a>, i2: BucketIndex<'a>) -> Self {
+        LockTwo { i1: i1, i2: i2, dummy: () }
     }
 
-    #[inline]
-    pub fn i1(&self) -> BucketIndex<'a> {
-        self.i1
-    }
-
-    #[inline]
-    pub fn i2(&self) -> BucketIndex<'a> {
-        self.i2
-    }
-
-    pub fn release(self) {
+    pub fn release<K, V>(self, ti: &Snapshot<'a, K, V>) {
         unsafe {
-            unlock_two(&self.ti, self.i1, self.i2);
+            unlock_two(ti, self.i1, self.i2);
         }
     }
 
-    pub fn bucket1(&mut self) -> (&mut Bucket<K, V>, &TableInfo<K, V>) {
+    pub fn bucket1<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
         unsafe {
-            (&mut *self.ti.buckets.get_unchecked(*self.i1).get(), &self.ti)
+            &mut *ti.buckets.get_unchecked(*self.i1).get()
         }
     }
 
-    pub fn bucket2(&mut self) -> (&mut Bucket<K, V>, &TableInfo<K, V>) {
+    pub fn bucket2<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
         unsafe {
-            (&mut *self.ti.buckets.get_unchecked(*self.i2).get(), &self.ti)
+            &mut *ti.buckets.get_unchecked(*self.i2).get()
         }
     }
 }

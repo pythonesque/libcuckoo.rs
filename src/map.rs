@@ -167,9 +167,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
-        self.snapshot_and_lock_two(&hazard_pointer, hv, move |mut snapshot| {
-            let st = cuckoo_find(key, hv, &mut snapshot);
-            snapshot.release();
+        self.snapshot_and_lock_two(&hazard_pointer, hv, move |snapshot, mut lock| {
+            let st = cuckoo_find(key, hv, &snapshot, &mut lock);
+            lock.release(&snapshot);
             st
         })
     }
@@ -181,9 +181,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
-        self.snapshot_and_lock_two(&hazard_pointer, hv, move |mut snapshot| {
-            let result = cuckoo_contains(key, hv, &mut snapshot);
-            snapshot.release();
+        self.snapshot_and_lock_two(&hazard_pointer, hv, move |snapshot, mut lock| {
+            let result = cuckoo_contains(key, hv, &snapshot, &mut lock);
+            lock.release(&snapshot);
             result
         })
     }
@@ -201,10 +201,10 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, &key);
-        self.snapshot_and_lock_two(&hazard_pointer, hv, |snapshot| {
+        self.snapshot_and_lock_two(&hazard_pointer, hv, |snapshot, lock| {
             unsafe {
                 table_info::check_counterid();
-                self.cuckoo_insert_loop(&hazard_pointer, key, v, hv, snapshot)
+                self.cuckoo_insert_loop(&hazard_pointer, key, v, hv, (snapshot, lock))
             }
         })
     }
@@ -215,12 +215,12 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     pub fn erase(&self, key: &K) -> Option<V> {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
-        self.snapshot_and_lock_two(&hazard_pointer, hv, move |mut snapshot| {
+        self.snapshot_and_lock_two(&hazard_pointer, hv, move |snapshot, mut lock| {
             let result = unsafe {
                 table_info::check_counterid();
-                cuckoo_delete(key, hv, &mut snapshot)
+                cuckoo_delete(key, hv, &snapshot, &mut lock)
             };
-            snapshot.release();
+            lock.release(&snapshot);
             result
         })
     }
@@ -232,9 +232,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
-        self.snapshot_and_lock_two(&hazard_pointer, hv, move |mut snapshot| {
-            let result = cuckoo_update(key, val, hv, &mut snapshot);
-            snapshot.release();
+        self.snapshot_and_lock_two(&hazard_pointer, hv, move |snapshot, mut lock| {
+            let result = cuckoo_update(key, val, hv, &snapshot, &mut lock);
+            lock.release(&snapshot);
             result
         })
     }
@@ -249,9 +249,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
-        self.snapshot_and_lock_two(&hazard_pointer, hv, move |mut snapshot| {
-            let result = cuckoo_update_fn(key, &mut updater, hv, &mut snapshot);
-            snapshot.release();
+        self.snapshot_and_lock_two(&hazard_pointer, hv, move |snapshot, mut lock| {
+            let result = cuckoo_update_fn(key, &mut updater, hv, &snapshot, &mut lock);
+            lock.release(&snapshot);
             result
         })
     }
@@ -271,16 +271,17 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         let hv = hashed_key(&self.hash_state, &key);
         loop {
             let updater = &mut updater;
-            match self.snapshot_and_lock_two(hazard_pointer, hv, move |mut snapshot| {
-                match cuckoo_update_fn(&key, updater, hv, &mut snapshot) {
+            match self.snapshot_and_lock_two(hazard_pointer, hv, move |snapshot, mut lock| {
+                match cuckoo_update_fn(&key, updater, hv, &snapshot, &mut lock) {
                     v @ Some(_) => {
-                        snapshot.release();
+                        lock.release(&snapshot);
                         return Ok(v);
                     },
                     // We run an insert, since the update failed
                     None => unsafe {
                         table_info::check_counterid();
-                        match self.cuckoo_insert_loop(hazard_pointer, key, val, hv, snapshot) {
+                        match self.cuckoo_insert_loop(hazard_pointer, key, val, hv,
+                                                      (snapshot, lock)) {
                             Ok(()) => return Ok(None),
                             // The only valid reason for res being false is if insert
                             // encountered a duplicate key after releasing the locks and
@@ -383,7 +384,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// needs to be grabbed first.
     fn snapshot_and_lock_two<F, T>(&self, hazard_pointer: &HazardPointer, hv: usize, closure: F)
                                    -> T
-            where F: for <'a> FnOnce(LockTwo<K, V>) -> T
+            where F: for <'a> FnOnce(Snapshot<'a, K, V>, LockTwo<'a>) -> T
     {
         loop {
             unsafe {
@@ -399,7 +400,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                     continue;
                 }
 
-                return closure(LockTwo::new(ti, i1, i2));
+                return closure(ti, LockTwo::new(i1, i2));
             }
         }
     }
@@ -681,45 +682,43 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     ///
     /// Unsafe because (with counter enabled) it assumes that the counter has been checked and is in
     /// bounds.
-    unsafe fn cuckoo_insert(&self,
-                            key: K, val: V,
-                            hv: usize, mut snapshot: LockTwo<K, V>) -> InsertResult<(), K, V> where
+    unsafe fn cuckoo_insert<'a>(&self,
+                                key: K, val: V,
+                                hv: usize,
+                                mut snapshot_lock: (Snapshot<'a, K, V>, LockTwo<'a>))
+                                -> InsertResult<(), K, V> where
             K: Copy + Eq,
     {
+        let snapshot = &snapshot_lock.0;
+        let mut lock = snapshot_lock.1;
         //const partial_t partial = partial_key(hv);
         let partial = ();
-        match try_find_insert_bucket(partial, &key, snapshot.bucket1().0) {
+        match try_find_insert_bucket(partial, &key, lock.bucket1(snapshot)) {
             Err(KeyDuplicated) => {
-                snapshot.release();
+                lock.release(snapshot);
                 return Err((KeyDuplicated, key, val));
             },
-            res1 => match try_find_insert_bucket(partial, &key, snapshot.bucket2().0) {
+            res1 => match try_find_insert_bucket(partial, &key, lock.bucket2(snapshot)) {
                 Err(KeyDuplicated) => {
-                    snapshot.release();
+                    lock.release(snapshot);
                     return Err((KeyDuplicated, key, val));
                 },
                 res2 => {
                     if let Ok(res1) = res1 {
-                        {
-                            let (bucket1, ti) = snapshot.bucket1();
-                            add_to_bucket(ti, partial, key, val, bucket1, res1);
-                        }
-                        snapshot.release();
+                        add_to_bucket(snapshot, partial, key, val, lock.bucket1(snapshot), res1);
+                        lock.release(snapshot);
                         return Ok(());
                     }
                     if let Ok(res2) = res2 {
-                        {
-                            let (bucket2, ti) = snapshot.bucket2();
-                            add_to_bucket(ti, partial, key, val, bucket2, res2);
-                        }
-                        snapshot.release();
+                        add_to_bucket(snapshot, partial, key, val, lock.bucket2(snapshot), res2);
+                        lock.release(snapshot);
                         return Ok(());
                     }
                 }
             }
         }
         // we are unlucky, so let's perform cuckoo hashing
-        match self.run_cuckoo(snapshot.ti(), snapshot.i1(), snapshot.i2()) {
+        match self.run_cuckoo(snapshot, lock.i1, lock.i2) {
             Err(CuckooError::UnderExpansion) => {
                 // The run_cuckoo operation operated on an old version of the table,
                 // so we have to try again. We signal to the calling insert method
@@ -735,13 +734,13 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 // Since we unlocked the buckets during run_cuckoo, another insert
                 // could have inserted the same key into either i1 or i2, so we
                 // check for that before doing the insert.
-                if cuckoo_contains(&key, hv, &mut snapshot) {
-                    snapshot.release();
+                if cuckoo_contains(&key, hv, snapshot, &mut lock) {
+                    lock.release(snapshot);
                     return Err((KeyDuplicated, key, val));
                 }
-                add_to_bucket(snapshot.ti(), partial, key, val,
+                add_to_bucket(snapshot, partial, key, val,
                               insert_bucket, insert_slot);
-                snapshot.release();
+                lock.release(snapshot);
                 Ok(())
             },
             Err(CuckooError::TableFull) => {
@@ -763,8 +762,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     unsafe fn cuckoo_insert_loop<'a>(&self, hazard_pointer: &HazardPointer,
                                      mut key: K, mut val: V,
                                      hv: usize,
-                                     mut snapshot: LockTwo<'a, K, V>)
-                                     //mut snapshot: LockTwo<K, V>)
+                                     mut snapshot_lock: (Snapshot<'a, K, V>, LockTwo<'a>))
                                      -> InsertResult<(), K, V> where
             K: Copy + Send + Sync,
             V: Send + Sync,
@@ -773,8 +771,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         // TODO: investigate this claim:
         //   "by the end of the function, the hazard pointer will have been unset."
         loop {
-            let hashpower = snapshot.ti().hashpower;
-            let res = self.cuckoo_insert(key, val, hv, snapshot);
+            let hashpower = snapshot_lock.0.hashpower;
+            let res = self.cuckoo_insert(key, val, hv, snapshot_lock);
             let (key_, val_) = match res {
                 // If the insert failed with failure_key_duplicated, it returns here
                 Err((KeyDuplicated, key, val)) => return Err((KeyDuplicated, key, val)),
@@ -800,11 +798,12 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             };
             key = key_;
             val = val_;
-            snapshot = self.snapshot_and_lock_two(hazard_pointer, hv, |snapshot_| {
+            snapshot_lock = self.snapshot_and_lock_two(hazard_pointer,
+                                                       hv, |snapshot_, lock_| {
                 // This is safe because ti was moved into cuckoo_insert_loop, so it can't be relied
                 // on outside of this function anyway, and there are no locals within this function
                 // that outlast the loop body and depend on the snapshot remaining the same.
-                mem::transmute::<_, LockTwo<'a, K, V>>(snapshot_)
+                mem::transmute::<_, (Snapshot<'a, K, V>, LockTwo<'a>)>((snapshot_, lock_))
             });
         }
     }
@@ -1436,26 +1435,30 @@ fn try_update_bucket_fn<K, V, P, F, T>(_partial: P,
 /// cuckoo_find searches the table for the given key and value, storing the
 /// value in the val if it finds the key. It expects the locks to be taken
 /// and released outside the function.
-fn cuckoo_find<K, V>(key: &K, _hv: usize, snapshot: &mut LockTwo<K, V>) -> Option<V> where
+fn cuckoo_find<'a, K, V>(key: &K, _hv: usize,
+                         snapshot: &Snapshot<'a, K, V>,
+                         lock: &mut LockTwo<'a>) -> Option<V> where
         K: Copy + Eq,
         V: Copy,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    try_read_from_bucket(partial, key, snapshot.bucket1().0)
-        .or_else( || try_read_from_bucket(partial, key, snapshot.bucket2().0))
+    try_read_from_bucket(partial, key, lock.bucket1(snapshot))
+        .or_else( || try_read_from_bucket(partial, key, lock.bucket2(snapshot)))
 }
 
 /// cuckoo_contains searches the table for the given key, returning true if
 /// it's in the table and false otherwise. It expects the locks to be taken
 /// and released outside the function.
-fn cuckoo_contains<K, V>(key: &K, _hv: usize, snapshot: &mut LockTwo<K, V>) -> bool where
+fn cuckoo_contains<'a, K, V>(key: &K, _hv: usize,
+                             snapshot: &Snapshot<'a, K, V>,
+                             lock: &mut LockTwo<'a>) -> bool where
         K: Copy + Eq,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    check_in_bucket(partial, key, snapshot.bucket1().0)
-        || check_in_bucket(partial, key, snapshot.bucket2().0)
+    check_in_bucket(partial, key, lock.bucket1(snapshot))
+        || check_in_bucket(partial, key, lock.bucket2(snapshot))
 }
 
 /// cuckoo_delete searches the table for the given key and sets the slot with
@@ -1464,38 +1467,36 @@ fn cuckoo_contains<K, V>(key: &K, _hv: usize, snapshot: &mut LockTwo<K, V>) -> b
 ///
 /// Unsafe because (with counter enabled) it assumes that the counter has been checked and is in
 /// bounds.
-unsafe fn cuckoo_delete<K, V>(key: &K,
-                              _hv: usize, snapshot: &mut LockTwo<K, V>) -> Option<V> where
+unsafe fn cuckoo_delete<'a, K, V>(key: &K,
+                                  _hv: usize,
+                                  snapshot: &Snapshot<'a, K, V>,
+                                  lock: &mut LockTwo<'a>) -> Option<V> where
         K: Eq,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    let res = {
-        let (bucket1, ti) = snapshot.bucket1();
-        try_del_from_bucket(ti, partial, key, bucket1)
-    };
+    let res = try_del_from_bucket(snapshot, partial, key, lock.bucket1(snapshot));
     match res {
         v @ Some(_) => v,
-        None => {
-            let (bucket2, ti) = snapshot.bucket2();
-            try_del_from_bucket(ti, partial, key, bucket2)
-        }
+        None => try_del_from_bucket(snapshot, partial, key, lock.bucket2(snapshot))
     }
 }
 
 /// cuckoo_update searches the table for the given key and updates its value
 /// if it finds it. It expects the locks to be taken and released outside the
 /// function.
-fn cuckoo_update<K,V>(key: &K, val: V,
-                             _hv: usize, snapshot: &mut LockTwo<K, V>) -> Result<V, V> where
+fn cuckoo_update<'a, K, V>(key: &K, val: V,
+                           _hv: usize,
+                           snapshot: &Snapshot<'a, K, V>,
+                           lock: &mut LockTwo<'a>) -> Result<V, V> where
         K: Eq,
         V: Copy,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    match try_update_bucket(partial, key, val, snapshot.bucket1().0) {
+    match try_update_bucket(partial, key, val, lock.bucket1(snapshot)) {
         v @ Ok(_) => v,
-        Err(val) => try_update_bucket(partial, key, val, snapshot.bucket2().0)
+        Err(val) => try_update_bucket(partial, key, val, lock.bucket2(snapshot))
     }
 }
 
@@ -1503,16 +1504,18 @@ fn cuckoo_update<K,V>(key: &K, val: V,
 /// function on its value if it finds it, assigning the result of the
 /// function to the value. It expects the locks to be taken and released
 /// outside the function.
-fn cuckoo_update_fn<K, V, F, T>(key: &K, updater: &mut F,
-                                       _hv: usize, snapshot: &mut LockTwo<K, V>) -> Option<T> where
+fn cuckoo_update_fn<'a, K, V, F, T>(key: &K, updater: &mut F,
+                                    _hv: usize,
+                                    snapshot: &Snapshot<'a, K, V>,
+                                    lock: &mut LockTwo<'a>) -> Option<T> where
         K: Eq,
         F: FnMut(&mut V) -> T,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    match try_update_bucket_fn(partial, key, updater, snapshot.bucket1().0) {
+    match try_update_bucket_fn(partial, key, updater, lock.bucket1(snapshot)) {
         v @ Some(_) => v,
-        None => try_update_bucket_fn(partial, key, updater, snapshot.bucket2().0)
+        None => try_update_bucket_fn(partial, key, updater, lock.bucket2(snapshot))
     }
 }
 
