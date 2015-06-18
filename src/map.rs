@@ -369,9 +369,6 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// issue, where the address of the new table_info equals the address of a
     /// previously deleted one, however it doesn't matter, since we would still
     /// be looking at the most recent table_info in that case.
-    /// Unsafe because it does not enforce the invariant that the returned `HazardPointer<'a> is
-    /// unique throughout the application.  This must be enforced by the caller (e.g. the various
-    /// `snapshot` methods).
     fn snapshot_table_nolock<'a>(&self, hazard_pointer: &'a HazardPointer)
                                  -> HazardPointerSet<'a, TableInfo<K, V>> {
         self.snapshot(hazard_pointer)
@@ -685,7 +682,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     unsafe fn cuckoo_insert<'a>(&self,
                                 key: K, val: V,
                                 hv: usize,
-                                mut snapshot_lock: (Snapshot<'a, K, V>, LockTwo<'a>))
+                                snapshot_lock: (Snapshot<'a, K, V>, LockTwo<'a>))
                                 -> InsertResult<(), K, V> where
             K: Copy + Eq,
     {
