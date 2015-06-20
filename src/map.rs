@@ -375,8 +375,9 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             where F: for <'a> FnOnce(Snapshot<'a, K, V>, LockTwo<'a>) -> T
     {
         loop {
-            let ti = self.snapshot(hazard_pointer);
+            let ti;
             let ti = unsafe {
+                ti = self.snapshot(hazard_pointer);
                 Snapshot::new(&ti)
             };
             let i1 = BucketIndex::new(&ti, hv);

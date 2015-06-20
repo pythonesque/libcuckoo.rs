@@ -107,7 +107,7 @@ fn main() {
     //let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::default();
     const CAPACITY: usize = 1 << 22;
     type Key = u64;//u32;//();
-    type MapKey = u64;
+    type MapKey = Key;
     #[inline(always)] const fn map_key(key: Key) -> MapKey { key }
     type Val = bool;//[[u64; 8]; 16];//();
     const RED: Val = false;//[[0 ; 8]; 16];//();
