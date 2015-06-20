@@ -2,7 +2,6 @@ use num_cpus;
 use std::cell::UnsafeCell;
 #[cfg(feature = "counter")]
 use std::cell::Cell;
-use std::cmp::Ordering::{Less, Greater, Equal};
 use std::intrinsics;
 use std::marker::PhantomData;
 use std::mem;
@@ -517,27 +516,41 @@ impl<'a> Deref for BucketIndex<'a> {
 pub struct LockTwo<'a> {
     i1: BucketIndex<'a>,
     i2: BucketIndex<'a>,
-    dummy: (),
 }
 
 impl<'a> LockTwo<'a> {
-    /// Unsafe because it assumes that i1 and i2 are in bounds and locked.
     #[inline]
-    pub unsafe fn new(i1: BucketIndex<'a>, i2: BucketIndex<'a>) -> Self {
-        LockTwo { i1: i1, i2: i2, dummy: () }
-    }
-
-    pub fn i1(&self) -> BucketIndex<'a> {
-        self.i1
-    }
-
-    pub fn i2(&self) -> BucketIndex<'a> {
-        self.i2
-    }
-
-    pub fn release<K, V>(self, ti: &Snapshot<'a, K, V>) {
+    /// locks the two bucket indexes, always locking the earlier index
+    /// first to avoid deadlock. If the two indexes are the same, it just locks
+    /// one.
+    pub fn new<K, V>(ti: &Snapshot<'a, K, V>, b1: BucketIndex<'a>, b2: BucketIndex<'a>) -> Self {
         unsafe {
-            unlock_two(ti, self.i1, self.i2);
+            let mut i1 = lock_ind(*b1);
+            let mut i2 = lock_ind(*b2);
+            let locks = &ti.locks;
+            if i1 > i2 {
+                mem::swap(&mut i1, &mut i2);
+            }
+            locks.get_unchecked(i1).lock();
+            if i1 != i2 {
+                locks.get_unchecked(i2).lock();
+            }
+            LockTwo { i1: b1, i2: b2, }
+        }
+    }
+
+    /// unlocks both of the given bucket indexes, or only one if they
+    /// are equal. Order doesn't matter here.
+    pub fn release<K, V>(self, ti: &Snapshot<'a, K, V>) -> (BucketIndex<'a>, BucketIndex<'a>) {
+        unsafe {
+            let i1 = lock_ind(*self.i1);
+            let i2 = lock_ind(*self.i2);
+            let locks = &ti.locks;
+            locks.get_unchecked(i1).unlock();
+            if i1 != i2 {
+                locks.get_unchecked(i2).unlock();
+            }
+            (self.i1, self.i2)
         }
     }
 
@@ -570,156 +583,93 @@ pub unsafe fn unlock<'a, K, V>(ti: &Snapshot<'a, K, V>, i: BucketIndex<'a>) {
     ti.locks.get_unchecked(lock_ind(*i)).unlock();
 }
 
-/// lock_two locks the two bucket indexes, always locking the earlier index
-/// first to avoid deadlock. If the two indexes are the same, it just locks
-/// one.
-pub fn lock_two<'a, K, V>(ti: &Snapshot<'a, K, V>,
-                          i1: BucketIndex<'a>, i2: BucketIndex<'a>) {
-    unsafe {
-        let i1 = lock_ind(*i1);
-        let i2 = lock_ind(*i2);
-        let locks = &ti.locks;
-        match i1.cmp(&i2) {
-            Less => {
-                locks.get_unchecked(i1).lock();
-                locks.get_unchecked(i2).lock();
-            },
-            Greater => {
-                locks.get_unchecked(i2).lock();
-                locks.get_unchecked(i1).lock();
-            },
-            Equal => {
-                locks.get_unchecked(i1).lock()
-            },
-        }
-        /*if (i1 < i2) {
-            ti->locks_[i1].lock();
-            ti->locks_[i2].lock();
-        } else if (i2 < i1) {
-            ti->locks_[i2].lock();
-            ti->locks_[i1].lock();
-        } else {
-            ti->locks_[i1].lock();
-        }*/
-    }
+pub struct LockThree<'a> {
+    i1: BucketIndex<'a>,
+    i2: BucketIndex<'a>,
+    i3: BucketIndex<'a>,
 }
 
-/// unlock_two unlocks both of the given bucket indexes, or only one if they
-/// are equal. Order doesn't matter here.
-///
-/// Unsafe because it assumes that the locks are taken.
-pub unsafe fn unlock_two<'a, K, V>(ti: &Snapshot<'a, K, V>,
-                                   i1: BucketIndex<'a>, i2: BucketIndex<'a>) {
-    let i1 = lock_ind(*i1);
-    let i2 = lock_ind(*i2);
-    let locks = &ti.locks;
-    locks.get_unchecked(i1).unlock();
-    if i1 != i2 {
-        locks.get_unchecked(i2).unlock();
-    }
-}
-
-/// lock_three locks the three bucket indexes in numerical order.
-pub fn lock_three<'a, K, V>(ti: &Snapshot<'a, K, V>,
-                            b1: BucketIndex<'a>, b2: BucketIndex<'a>, b3: BucketIndex<'a>) {
-    unsafe {
-        let i1 = lock_ind(*b1);
-        let i2 = lock_ind(*b2);
-        let i3 = lock_ind(*b3);
-        /*let locks = &ti.locks;
-        match (i1.cmp(i2), i2.cmp(i3), i1.cmp(i3)) {
-            // If any are the same, we just run lock_two
-            (Equal, _, _) | (_, Equal, _) => lock_two(ti, i1, i3),
-            (_, _, Equal) => lock_two(ti, i1, i2),
-            (Less, Less, /*Less - if Greater something is wrong.*/_) =>  {
-                locks.get_unchecked(i1).lock();
-                locks.get_unchecked(i2).lock();
-                locks.get_unchecked(i3).lock();
-            },
-            (Less, /*Greater*/_, Less) => {
-                locks.get_unchecked(i1).lock();
-                locks.get_unchecked(i3).lock();
-                locks.get_unchecked(i2).lock();
-            },
-            (Less, /*Greater*/_, /*Greater*/_) => {
-                locks.get_unchecked(i3).lock();
-                locks.get_unchecked(i1).lock();
-                locks.get_unchecked(i2).lock();
-            },
-            (/*Greater*/_, Less, Less) => {
-                locks.get_unchecked(i2).lock();
-                locks.get_unchecked(i1).lock();
-                locks.get_unchecked(i3).lock();
-            },
-            (/*Greater*/_, Less, /*Greater*/_) => {
-                locks.get_unchecked(i2).lock();
-                locks.get_unchecked(i3).lock();
-                locks.get_unchecked(i1).lock();
-            },
-            _/*(Greater, Greater, Greater)*/ => {
-                locks.get_unchecked(i3).lock();
-                locks.get_unchecked(i2).lock();
-                locks.get_unchecked(i1).lock();
-            },
-        }*/
-        // If any are the same, we just run lock_two
-        if i1 == i2 {
-            lock_two(ti, b1, b3);
-        } else if i2 == i3 {
-            lock_two(ti, b1, b3);
-        } else if i1 == i3 {
-            lock_two(ti, b1, b2);
-        } else {
+impl<'a> LockThree<'a> {
+    #[inline]
+    /// locks the three bucket indexes in numerical order.
+    pub fn new<K, V>(ti: &Snapshot<'a, K, V>,
+                     b1: BucketIndex<'a>, b2: BucketIndex<'a>, b3: BucketIndex<'a>) -> Self {
+        unsafe {
+            let mut i1 = lock_ind(*b1);
+            let mut i2 = lock_ind(*b2);
+            let mut i3 = lock_ind(*b3);
+            if i1 > i2 {
+                mem::swap(&mut i1, &mut i2);
+            }
+            if i2 > i3 {
+                mem::swap(&mut i2, &mut i3);
+            }
+            if i1 > i2 {
+                mem::swap(&mut i1, &mut i2);
+            }
             let locks = &ti.locks;
-            if i1 < i2 {
-                if i2 < i3 {
-                    locks.get_unchecked(i1).lock();
-                    locks.get_unchecked(i2).lock();
-                    locks.get_unchecked(i3).lock();
-                } else if i1 < i3 {
-                    locks.get_unchecked(i1).lock();
-                    locks.get_unchecked(i3).lock();
-                    locks.get_unchecked(i2).lock();
-                } else {
-                    locks.get_unchecked(i3).lock();
-                    locks.get_unchecked(i1).lock();
-                    locks.get_unchecked(i2).lock();
-                }
-            } else if i2 < i3 {
-                if i1 < i3 {
-                    locks.get_unchecked(i2).lock();
-                    locks.get_unchecked(i1).lock();
-                    locks.get_unchecked(i3).lock();
-                } else {
-                    locks.get_unchecked(i2).lock();
-                    locks.get_unchecked(i3).lock();
-                    locks.get_unchecked(i1).lock();
-                }
-            } else {
-                locks.get_unchecked(i3).lock();
+            locks.get_unchecked(i1).lock();
+            if i2 != i1 {
                 locks.get_unchecked(i2).lock();
-                locks.get_unchecked(i1).lock();
+            }
+            if i3 != i2 {
+                locks.get_unchecked(i3).lock();
+            }
+            LockThree { i1: b1, i2: b2, i3: b3 }
+        }
+    }
+
+    /// unlocks the three locked buckets
+    pub fn release<K, V>(self, ti: &Snapshot<'a, K, V>) {
+        unsafe {
+            let i1 = lock_ind(*self.i1);
+            let i2 = lock_ind(*self.i2);
+            let i3 = lock_ind(*self.i3);
+            let locks = &ti.locks;
+            locks.get_unchecked(i1).unlock();
+            if i2 != i1 {
+                locks.get_unchecked(i2).unlock();
+            }
+            if i3 != i1 && i3 != i2 {
+                locks.get_unchecked(i3).unlock();
             }
         }
     }
-}
 
-/// unlock_three unlocks the three given buckets
-///
-/// Unsafe because it assumes that all the locks are taken.
-pub unsafe fn unlock_three<'a, K, V>(ti: &Snapshot<'a, K, V>,
-                                     i1: BucketIndex<'a>, i2: BucketIndex<'a>, i3: BucketIndex<'a>)
-{
-    let i1 = lock_ind(*i1);
-    let i2 = lock_ind(*i2);
-    let i3 = lock_ind(*i3);
-    let locks = &ti.locks;
-    locks.get_unchecked(i1).unlock();
-    if i2 != i1 {
-        locks.get_unchecked(i2).unlock();
+    pub fn release3<K, V>(self, ti: &Snapshot<'a, K, V>) -> LockTwo<'a> {
+        unsafe {
+            let i1 = lock_ind(*self.i1);
+            let i2 = lock_ind(*self.i2);
+            let i3 = lock_ind(*self.i3);
+            if i3 != i1 && i3 != i2 {
+                ti.locks.get_unchecked(i3).unlock();
+            }
+            LockTwo { i1: self.i1, i2: self.i2 }
+        }
     }
-    if i3 != i1 && i3 != i2 {
-        locks.get_unchecked(i3).unlock();
+
+    pub fn bucket1<K, V>(&self, ti: &Snapshot<'a, K, V>) -> &Bucket<K, V> {
+        unsafe {
+            &*ti.buckets.get_unchecked(*self.i1).get()
+        }
+    }
+
+    pub fn bucket1_mut<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
+        unsafe {
+            &mut *ti.buckets.get_unchecked(*self.i1).get()
+        }
+    }
+
+    pub fn bucket3<K, V>(&self, ti: &Snapshot<'a, K, V>) -> &Bucket<K, V> {
+        unsafe {
+            &*ti.buckets.get_unchecked(*self.i3).get()
+        }
+    }
+
+    pub fn bucket3_mut<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
+        unsafe {
+            &mut *ti.buckets.get_unchecked(*self.i3).get()
+        }
     }
 }
 
@@ -749,7 +699,7 @@ impl<'a, K, V> Drop for AllUnlocker<'a, K, V> {
 
 /// lock_ind converts an index into buckets_ to an index into locks_.
 #[inline(always)]
-pub fn lock_ind(bucket_ind: usize) -> usize {
+fn lock_ind(bucket_ind: usize) -> usize {
     bucket_ind & (K_NUM_LOCKS - 1)
 }
 
