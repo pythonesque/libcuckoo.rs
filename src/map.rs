@@ -33,11 +33,6 @@ static const bool value_copy_assignable = std::is_copy_assignable<
     FunctionNotSupported,
 }*/
 
-enum CuckooError {
-    TableFull,
-    UnderExpansion,
-}
-
 //#[derive(Debug)]
 pub enum InsertError {
     KeyDuplicated,
@@ -162,7 +157,6 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// find searches through the table for `key`, and returns `Some(value)` if
     /// it finds the value, `None` otherwise.
     pub fn find(&self, key: &K) -> Option<V> where
-            K: Copy,
             V: Copy,
     {
         let hazard_pointer = check_hazard_pointer();
@@ -176,9 +170,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
 
     /// contains searches through the table for `key`, and returns true if it
     /// finds it in the table, and false otherwise.
-    pub fn contains(&self, key: &K) -> bool where
-            K: Copy,
-    {
+    pub fn contains(&self, key: &K) -> bool {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         //const partial_t partial = partial_key(hv);
@@ -675,7 +667,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 Err((KeyDuplicated, key, val))
             } else {
                 add_to_bucket(ti, &counterid, partial, key, val,
-                              lock.bucket1(ti), slot);
+                              lock.bucket1_mut(ti), slot);
                 lock.release(ti);
                 Ok(())
             }
@@ -723,12 +715,12 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 },
                 res2 => {
                     if let Ok(res1) = res1 {
-                        add_to_bucket(snapshot, &counterid, partial, key, val, lock.bucket1(snapshot), res1);
+                        add_to_bucket(snapshot, &counterid, partial, key, val, lock.bucket1_mut(snapshot), res1);
                         lock.release(snapshot);
                         return Ok(());
                     }
                     if let Ok(res2) = res2 {
-                        add_to_bucket(snapshot, &counterid, partial, key, val, lock.bucket2(snapshot), res2);
+                        add_to_bucket(snapshot, &counterid, partial, key, val, lock.bucket2_mut(snapshot), res2);
                         lock.release(snapshot);
                         return Ok(());
                     }
@@ -1237,28 +1229,37 @@ unsafe fn cuckoopath_move<'a, K, V>(ti: &Snapshot<'a, K, V>,
 
 /// try_read_from_bucket will search the bucket for the given key and store
 /// the associated value if it finds it.
-fn try_read_from_bucket<K, V, P>(_partial: P, key: &K, bucket: &Bucket<K, V>) -> Option<V> where
-        K: Copy + Eq,
-        V: Copy,
+fn try_read_from_bucket<'a, K, V, P>(_partial: P, key: &K, bucket: &'a Bucket<K, V>) -> Option<&'a V> where
+        K: Eq,
 {
-    for slot in bucket.slots() {
+    /*for i in SlotIndexIter::new() {
+        if bucket.occupied(i) {
+            unsafe {
+                if key == bucket.key(i) {
+                    return Some(bucket.val(i))
+                }
+            }
+        }
+    }*/
+    /*for slot in bucket.slots() {
         // For now, we know we are "simple" so we skip this part.
         // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
         //     continue;
         // }
         if key == slot.key() {
-            return Some(*slot.val());
+            return Some(slot.val());
         }
     }
-    None
+    None*/
+    bucket.find(key)
 }
 
 /// check_in_bucket will search the bucket for the given key and return true
 /// if the key is in the bucket, and false if it isn't.
 fn check_in_bucket<K, V, P>(_partial: P, key: &K, bucket: &Bucket<K, V>) -> bool where
-        K: Copy + Eq,
+        K: Eq,
 {
-    for slot in bucket.slots() {
+    /*for slot in bucket.slots() {
         // For now, we know we are "simple" so we skip this part.
         // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
         //     continue;
@@ -1267,7 +1268,8 @@ fn check_in_bucket<K, V, P>(_partial: P, key: &K, bucket: &Bucket<K, V>) -> bool
             return true;
         }
     }
-    false
+    false*/
+    bucket.find(key).is_some()
 }
 
 /// add_to_bucket will insert the given key-value pair into the slot.
@@ -1276,7 +1278,7 @@ fn add_to_bucket<'a, K, V, P>(ti: &Snapshot<'a, K, V>,
                               _partial: P,
                               key: K, val: V,
                               bucket: &mut Bucket<K, V>, j: SlotIndex) where
-        K: Copy + Eq,
+        K: Eq,
         /*K: fmt::Debug,*/
         /*V: fmt::Debug,*/
 {
@@ -1306,7 +1308,7 @@ fn try_find_insert_bucket<K, V, P>(_partial: P,
                                    key: &K,
                                    bucket: &Bucket<K, V>)
                                    -> Result<SlotIndex, InsertError> where
-        K: Copy + Eq,
+        K: Eq,
 {
     let mut found_empty = Err(TableFull);
     for k in SlotIndexIter::new() {
@@ -1365,7 +1367,6 @@ fn try_del_from_bucket<'a, K, V, P>(ti: &Snapshot<'a, K, V>,
 fn try_update_bucket<K, V, P>(_partial: P, key: &K, value: V, bucket: &mut Bucket<K, V>)
                               -> Result<V, V> where
         K: Eq,
-        V: Copy,
 {
     for mut slot in bucket.slots_mut() {
         // For now, we know we are "simple" so we skip this part.
@@ -1406,13 +1407,14 @@ fn try_update_bucket_fn<K, V, P, F, T>(_partial: P,
 fn cuckoo_find<'a, K, V>(key: &K, _hv: usize,
                          snapshot: &Snapshot<'a, K, V>,
                          lock: &mut LockTwo<'a>) -> Option<V> where
-        K: Copy + Eq,
+        K: Eq,
         V: Copy,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
     try_read_from_bucket(partial, key, lock.bucket1(snapshot))
-        .or_else( || try_read_from_bucket(partial, key, lock.bucket2(snapshot)))
+        .or_else( || try_read_from_bucket(partial, key, lock.bucket2(snapshot)) )
+        .map( |&v| v )
 }
 
 /// cuckoo_contains searches the table for the given key, returning true if
@@ -1421,7 +1423,7 @@ fn cuckoo_find<'a, K, V>(key: &K, _hv: usize,
 fn cuckoo_contains<'a, K, V, P>(key: &K,
                                 snapshot: &Snapshot<'a, K, V>,
                                 lock: &mut LockTwo<'a>, partial: P) -> bool where
-        K: Copy + Eq,
+        K: Eq,
         P: Copy,
 {
     check_in_bucket(partial, key, lock.bucket1(snapshot))
@@ -1440,10 +1442,10 @@ fn cuckoo_delete<'a, K, V>(key: &K,
     //const partial_t partial = partial_key(hv);
     let partial = ();
     let counterid = table_info::check_counterid(&snapshot);
-    let res = try_del_from_bucket(snapshot, &counterid, partial, key, lock.bucket1(snapshot));
+    let res = try_del_from_bucket(snapshot, &counterid, partial, key, lock.bucket1_mut(snapshot));
     match res {
         v @ Some(_) => v,
-        None => try_del_from_bucket(snapshot, &counterid, partial, key, lock.bucket2(snapshot))
+        None => try_del_from_bucket(snapshot, &counterid, partial, key, lock.bucket2_mut(snapshot))
     }
 }
 
@@ -1455,13 +1457,12 @@ fn cuckoo_update<'a, K, V>(key: &K, val: V,
                            snapshot: &Snapshot<'a, K, V>,
                            lock: &mut LockTwo<'a>) -> Result<V, V> where
         K: Eq,
-        V: Copy,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    match try_update_bucket(partial, key, val, lock.bucket1(snapshot)) {
+    match try_update_bucket(partial, key, val, lock.bucket1_mut(snapshot)) {
         v @ Ok(_) => v,
-        Err(val) => try_update_bucket(partial, key, val, lock.bucket2(snapshot))
+        Err(val) => try_update_bucket(partial, key, val, lock.bucket2_mut(snapshot))
     }
 }
 
@@ -1478,9 +1479,9 @@ fn cuckoo_update_fn<'a, K, V, F, T>(key: &K, updater: &mut F,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
-    match try_update_bucket_fn(partial, key, updater, lock.bucket1(snapshot)) {
+    match try_update_bucket_fn(partial, key, updater, lock.bucket1_mut(snapshot)) {
         v @ Some(_) => v,
-        None => try_update_bucket_fn(partial, key, updater, lock.bucket2(snapshot))
+        None => try_update_bucket_fn(partial, key, updater, lock.bucket2_mut(snapshot))
     }
 }
 
@@ -1518,7 +1519,8 @@ mod tests {
     extern crate test;
 
     use num_cpus;
-    use std::collections::hash_state::DefaultState;
+    use std::collections::hash_state::{DefaultState, HashState};
+    use std::hash::{Hash, Hasher};
     use std::i32;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1570,6 +1572,18 @@ mod tests {
     #[test]
     fn make_hashmap() {
         CuckooHashMap::<u64, u64>::default();
+    }
+
+    #[bench]
+    fn bench_hash(b: &mut test::Bencher) {
+        let hash_state = DefaultState::<FnvHasher>::default();
+        const KEY: u32 = !0;
+
+        b.iter( || {
+            let mut state = hash_state.hasher();
+            test::black_box(KEY).hash(&mut state);
+            test::black_box(state.finish() as usize)
+        } );
     }
 
     #[bench]

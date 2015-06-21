@@ -70,8 +70,8 @@ impl Iterator for SlotIndexIter
         // mishandles the version that places the mutation inside the
         // `if`: it seems to optimise the `Option<i32>` in a way that
         // confuses it.
-        let mut n = self.i + 1;
-        mem::swap(&mut n, &mut self.i);
+        let n = self.i;
+        self.i = n.wrapping_add(1);
         if n < SLOT_PER_BUCKET {
             Some(SlotIndex(n))
         } else {
@@ -97,7 +97,7 @@ impl<'a, K, V> Slot<'a, K, V> {
         }
     }
 
-    pub fn val(&self) -> &V {
+    pub fn val(&self) -> &'a V {
         unsafe {
             self.slot.val(self.index)
         }
@@ -106,7 +106,7 @@ impl<'a, K, V> Slot<'a, K, V> {
 
 pub struct SlotIter<'a, K: 'a, V: 'a> {
     slot: &'a Bucket<K, V>,
-    iter: SlotIndexIter,
+    i: usize,
 }
 
 impl<'a, K, V> Iterator for SlotIter<'a, K, V> {
@@ -114,17 +114,21 @@ impl<'a, K, V> Iterator for SlotIter<'a, K, V> {
 
     #[inline]
     fn next(&mut self) -> Option<Slot<'a, K, V>> {
-        for i in &mut self.iter {
-            if self.slot.occupied(i) {
-                return Some(Slot { slot: self.slot, index: i });
+        loop {
+            let i = self.i;
+            if i == SLOT_PER_BUCKET {
+                return None;
+            }
+            self.i = i.wrapping_add(1);
+            if self.slot.occupied(SlotIndex(i)) {
+                return Some(Slot { slot: self.slot, index: SlotIndex(i) });
             }
         }
-        None
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
+        (SLOT_PER_BUCKET - self.i, Some(SLOT_PER_BUCKET - self.i))
     }
 }
 
@@ -273,7 +277,45 @@ impl<K, V> Bucket<K, V> {
     }
 
     pub fn slots<'a>(&'a self) -> SlotIter<'a, K, V> {
-        SlotIter { slot: self, iter: SlotIndexIter::new() }
+        SlotIter { slot: self, i: 0 }
+    }
+
+    pub fn find<'a>(&'a self, key: &K) -> Option<&'a V> where
+            K: Eq,
+    {
+        for i in SlotIndexIter::new() {
+            if self.occupied(i) {
+                // For now, we know we are "simple" so we skip this part.
+                // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
+                //     continue;
+                // }
+                unsafe {
+                    if key == self.key(i) {
+                        return Some(self.val(i))
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn find_mut<'a>(&'a mut self, key: &K) -> Option<&'a mut V> where
+            K: Eq,
+    {
+        for i in SlotIndexIter::new() {
+            if self.occupied(i) {
+                // For now, we know we are "simple" so we skip this part.
+                // if (!is_simple && partial != ti->buckets_[i].partial(j)) {
+                //     continue;
+                // }
+                unsafe {
+                    if key == self.key(i) {
+                        return Some(self.val_mut(i))
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn slots_mut<'a>(&'a mut self) -> SlotIterMut<'a, K, V> {
@@ -554,13 +596,25 @@ impl<'a> LockTwo<'a> {
         }
     }
 
-    pub fn bucket1<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
+    pub fn bucket1<K, V>(&self, ti: &Snapshot<'a, K, V>) -> &Bucket<K, V> {
+        unsafe {
+            &*ti.buckets.get_unchecked(*self.i1).get()
+        }
+    }
+
+    pub fn bucket2<K, V>(&self, ti: &Snapshot<'a, K, V>) -> &Bucket<K, V> {
+        unsafe {
+            &*ti.buckets.get_unchecked(*self.i2).get()
+        }
+    }
+
+    pub fn bucket1_mut<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
         unsafe {
             &mut *ti.buckets.get_unchecked(*self.i1).get()
         }
     }
 
-    pub fn bucket2<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
+    pub fn bucket2_mut<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
         unsafe {
             &mut *ti.buckets.get_unchecked(*self.i2).get()
         }
