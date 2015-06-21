@@ -12,7 +12,7 @@ use std::thread;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use super::iter::Range;
 use super::hazard_pointer::{check_hazard_pointer, delete_unused, HazardPointer, HazardPointerSet};
-use super::table_info::{self, AllUnlocker, Bucket, BucketIndex, CounterIndex, LockTwo, LockThree, SlotIndex, SlotIndexIter, SLOT_PER_BUCKET, Snapshot, TableInfo};
+use super::table_info::{self, Bucket, BucketIndex, CounterIndex, Lock, LockTwo, LockThree, LockAll, SlotIndex, SlotIndexIter, SLOT_PER_BUCKET, Snapshot, TableInfo};
 
 /// DEFAULT_SIZE is the default number of elements in an empty hash
 /// table
@@ -93,26 +93,28 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// destructors.
     pub fn clear(&self) {
         let hazard_pointer = check_hazard_pointer();
-        unsafe {
-            let ti = self.snapshot_and_lock_all(&hazard_pointer);
-            //debug_assert!(ti == self.table_info.load(Ordering::SeqCst));
-            let _au = AllUnlocker::new(&ti);
-            // cuckoo_clear empties the table, calling the destructors of all the
-            // elements it removes from the table. It assumes the locks are taken as
-            // necessary.
-            for bucket in &mut (*ti.as_raw()).buckets {
-                (*bucket.get()).clear();
-            }
-            if cfg!(feature = "counter") {
-                let mut insert = ti.num_inserts.iter();
-                let mut delete = ti.num_deletes.iter();
-                while let Some(insert) = insert.next() {
-                    let delete = delete.next().unwrap_or_else(|| intrinsics::unreachable());
-                    insert.store_notatomic(0);
-                    delete.store_notatomic(0);
+            self.snapshot_and_lock_all(&hazard_pointer, move |ti, mut lock| {
+                //debug_assert!(ti == self.table_info.load(Ordering::SeqCst));
+                //let _au = AllUnlocker::new(&ti);
+                // cuckoo_clear empties the table, calling the destructors of all the
+                // elements it removes from the table. It assumes the locks are taken as
+                // necessary.
+                for bucket in lock.buckets(&ti) {
+                    bucket.clear();
                 }
-            }
-        }
+                if cfg!(feature = "counter") {
+                    unsafe {
+                        let mut insert = ti.num_inserts.iter();
+                        let mut delete = ti.num_deletes.iter();
+                        while let Some(insert) = insert.next() {
+                            let delete = delete.next().unwrap_or_else(|| intrinsics::unreachable());
+                            insert.store_notatomic(0);
+                            delete.store_notatomic(0);
+                        }
+                    }
+                }
+                lock.release(&ti);
+            });
     }
 
     /// size returns the number of items currently in the hash table. Since it
@@ -365,8 +367,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// depends on the number of buckets in the table, the table_info pointer
     /// needs to be grabbed first.
     fn snapshot_and_lock_two<F, T>(&self, hazard_pointer: &HazardPointer, hv: usize, closure: F)
-                                   -> T
-            where F: for <'a> FnOnce(Snapshot<'a, K, V>, LockTwo<'a>) -> T
+                                   -> T where
+            F: for <'a> FnOnce(Snapshot<'a, K, V>, LockTwo<'a>) -> T
     {
         loop {
             let ti;
@@ -390,21 +392,22 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
 
     /// snapshot_and_lock_all is similar to snapshot_and_lock_two, except that it
     /// takes all the locks in the table.
-    fn snapshot_and_lock_all<'a>(&self, hazard_pointer: &'a HazardPointer)
-                                 -> HazardPointerSet<'a, TableInfo<K, V>> {
+    fn snapshot_and_lock_all<F, T>(&self, hazard_pointer: &HazardPointer, closure: F) -> T where
+            F: for <'a> FnOnce(Snapshot<'a, K, V>, LockAll<'a>) -> T
+    {
         loop {
-            let ti = self.snapshot_table_nolock(hazard_pointer);
-            for lock in &ti.locks[..] {
-                lock.lock();
-            }
+            let ti;
+            let ti = unsafe {
+                ti = self.snapshot(hazard_pointer);
+                Snapshot::new(&ti)
+            };
+            let lock = LockAll::new(&ti);
             // If the table info has changed, unlock the locks and try again.
-            if ti.as_raw() != self.table_info.load(Ordering::SeqCst) {
-                unsafe {
-                    let _au = AllUnlocker::new(&ti);
-                }
+            if &*ti as *const _ != self.table_info.load(Ordering::SeqCst) {
+                lock.release(&ti);
                 continue;
             }
-            return ti;
+            return closure(ti, lock);
         }
     }
 
@@ -430,13 +433,12 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             for i in Range::new(0, SLOT_PER_BUCKET) {
                 if q.full() { break; }
                 let slot = SlotIndex::new(starting_slot.wrapping_add(i));
+                let lock = Lock::new(ti, x.bucket);
                 unsafe {
-                    table_info::lock(ti, x.bucket);
-                    let bucket = &*ti.buckets.get_unchecked(*x.bucket).get();
-                    if !bucket.occupied(slot) {
+                    if !lock.bucket(ti).occupied(slot) {
                         // We can terminate the search here
                         x.pathcode = x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(*slot);
-                        table_info::unlock(ti, x.bucket);
+                        lock.release(ti);
                         return x;
                     }
 
@@ -444,8 +446,8 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                     // create a new b_slot item, that represents the bucket we would
                     // have come from if we kicked out the item at this slot.
                     if x.depth < (MAX_BFS_PATH_LEN - 1) as Depth {
-                        let hv = hashed_key(&self.hash_state, bucket.key(slot));
-                        table_info::unlock(ti, x.bucket);
+                        let hv = hashed_key(&self.hash_state, lock.bucket(ti).key(slot));
+                        lock.release(ti);
                         let y = BSlot::new(alt_index(ti, hv, *x.bucket),
                                            x.pathcode.wrapping_mul(SLOT_PER_BUCKET).wrapping_add(*slot),
                                            x.depth.wrapping_add(1));
@@ -500,16 +502,15 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             };
             while curr != end {
                 (*curr).bucket = i;
-                table_info::lock(ti, i);
-                let bucket = &*ti.buckets.get_unchecked(*i).get();
-                if !bucket.occupied((*curr).slot) {
+                let lock = Lock::new(ti, i);
+                if !lock.bucket(ti).occupied((*curr).slot) {
                     // We can terminate here
-                    table_info::unlock(ti, i);
+                    lock.release(ti);
                     return ((curr as usize).wrapping_sub(start as usize)
                             / mem::size_of::<CuckooRecord<K>>()) as Depth;
                 }
-                (*curr).key = *bucket.key((*curr).slot);
-                table_info::unlock(ti, i);
+                (*curr).key = *lock.bucket(ti).key((*curr).slot);
+                lock.release(ti);
                 let hv = hashed_key(&self.hash_state, &(*curr).key);
                 /*debug_assert!((*curr).bucket == index_hash(ti, hv) ||
                               (*curr).bucket == alt_index(ti, hv, index_hash(ti, hv)));*/
@@ -878,12 +879,11 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             thread::scoped(move || insert_into_table_(new_map, ti, i, end) )
         }
 
-        unsafe {
+        self.snapshot_and_lock_all(hazard_pointer, move |ti, lock| {
             //println!("expand");
-            let ti = self.snapshot_and_lock_all(hazard_pointer);
             //println!("locked");
             //debug_assert!(ti == self.table_info.load(Ordering::SeqCst));
-            let _au = AllUnlocker::new(&ti);
+            //let _au = AllUnlocker::new(&ti);
             //TODO: Evaluate whether we actually do need this for some reason.  I don't really
             //understand why we would.
             //let _hpu = HazardPointerUnsetter::new(hazard_pointer);
@@ -901,66 +901,70 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 self.hash_state.clone());
             //let threadnum = num_cpus::get();
             let threadnum = ti.num_inserts.len();
-            if threadnum == 0 {
-                // Pretty sure this should actually be impossible.
-                // TODO: refactor this after I make sure.
-                //println!("Shouldn't be possible for thread num to equal zero.");
-                intrinsics::abort();
-            }
-            let buckets_per_thread =
-                intrinsics::unchecked_udiv(table_info::hashsize(ti.hashpower), threadnum);
+            unsafe {
+                if threadnum == 0 {
+                    // Pretty sure this should actually be impossible.
+                    // TODO: refactor this after I make sure.
+                    //println!("Shouldn't be possible for thread num to equal zero.");
+                    intrinsics::abort();
+                }
+                let buckets_per_thread =
+                    intrinsics::unchecked_udiv(table_info::hashsize(ti.hashpower), threadnum);
 
-            if mem::size_of::<Res>() != 0 &&
-               threadnum.checked_mul(mem::size_of::<Res>()).is_none() {
-                //println!("Overflow calculating join guard vector length");
-                intrinsics::abort();
-            }
-            {
-                //println!("computing");
-                let hashsize = table_info::hashsize(ti.hashpower);
-                let mut vec = Vec::with_capacity(threadnum);
-                let mut ptr = vec.as_mut_ptr();
-                let mut i = 0;
-                while i < threadnum.wrapping_sub(1) {
-                    let ti = TI(&ti);
-                    let start = i.wrapping_mul(buckets_per_thread);
-                    i = i.wrapping_add(1);
-                    let end = i.wrapping_mul(buckets_per_thread);
-                    let t = insert_into_table(new_map, ti, start, end);
-                    ptr::write(ptr, t);
-                    vec.set_len(i);
-                    ptr = ptr.offset(1);
+                if mem::size_of::<Res>() != 0 &&
+                   threadnum.checked_mul(mem::size_of::<Res>()).is_none() {
+                    //println!("Overflow calculating join guard vector length");
+                    intrinsics::abort();
                 }
                 {
-                    let ti = TI(&ti);
-                    let start = i.wrapping_mul(buckets_per_thread);
-                    let t = insert_into_table(new_map, ti, start, hashsize);
-                    ptr::write(ptr, t);
-                    vec.set_len(threadnum);
+                    //println!("computing");
+                    let hashsize = table_info::hashsize(ti.hashpower);
+                    let mut vec = Vec::with_capacity(threadnum);
+                    let mut ptr = vec.as_mut_ptr();
+                    let mut i = 0;
+                    while i < threadnum.wrapping_sub(1) {
+                        let ti = TI(&ti);
+                        let start = i.wrapping_mul(buckets_per_thread);
+                        i = i.wrapping_add(1);
+                        let end = i.wrapping_mul(buckets_per_thread);
+                        let t = insert_into_table(new_map, ti, start, end);
+                        ptr::write(ptr, t);
+                        vec.set_len(i);
+                        ptr = ptr.offset(1);
+                    }
+                    {
+                        let ti = TI(&ti);
+                        let start = i.wrapping_mul(buckets_per_thread);
+                        let t = insert_into_table(new_map, ti, start, hashsize);
+                        ptr::write(ptr, t);
+                        vec.set_len(threadnum);
+                    }
                 }
-            }
-            //println!("done computing");
-            // Sets this table_info to new_map's. It then sets new_map's
-            // table_info to nullptr, so that it doesn't get deleted when
-            // new_map goes out of scope
-            // NOTE: Relaxed load is likely sufficient here because we are the only thread that
-            // could possibly have access to it at the moment (the other threads that knew about it are
-            // joined now, and the join formed a synchronization point).  Keep it SeqCst anyway unless
-            // it proves to be a bottleneck (note that there is one other possible way for them to be
-            // written to--via deleted_unused--but it shouldn't be possible for that to run with a
-            // pointer with the same address as the old one at the same time).
-            //
-            // Not sure about the store... again, keeping it SeqCst for now.
-            self.table_info.store(new_map.table_info.load(Ordering::SeqCst), Ordering::SeqCst);
-            new_map.table_info.store(ptr::null_mut(), Ordering::SeqCst);
+                //println!("done computing");
+                // Sets this table_info to new_map's. It then sets new_map's
+                // table_info to nullptr, so that it doesn't get deleted when
+                // new_map goes out of scope
+                // NOTE: Relaxed load is likely sufficient here because we are the only thread that
+                // could possibly have access to it at the moment (the other threads that knew about it are
+                // joined now, and the join formed a synchronization point).  Keep it SeqCst anyway unless
+                // it proves to be a bottleneck (note that there is one other possible way for them to be
+                // written to--via deleted_unused--but it shouldn't be possible for that to run with a
+                // pointer with the same address as the old one at the same time).
+                //
+                // Not sure about the store... again, keeping it SeqCst for now.
+                self.table_info.store(new_map.table_info.load(Ordering::SeqCst), Ordering::SeqCst);
+                new_map.table_info.store(ptr::null_mut(), Ordering::SeqCst);
 
-            // Rather than deleting ti now, we store it in old_table_infos. We then
-            // run a delete_unused routine to delete all the old table pointers.
-            let old_table_infos = &mut *self.old_table_infos.get();
-            old_table_infos.push(mem::transmute(ti.as_raw()));
-            delete_unused(old_table_infos);
-            Ok(())
-        }
+                // Rather than deleting ti now, we store it in old_table_infos. We then
+                // run a delete_unused routine to delete all the old table pointers.
+                let old_table_infos = &mut *self.old_table_infos.get();
+                old_table_infos.push(mem::transmute(&*ti as *const _));
+                delete_unused(old_table_infos);
+                lock.release(&ti);
+                Ok(())
+            }
+        })
+    //}
     }
 }
 
@@ -1232,15 +1236,6 @@ unsafe fn cuckoopath_move<'a, K, V>(ti: &Snapshot<'a, K, V>,
 fn try_read_from_bucket<'a, K, V, P>(_partial: P, key: &K, bucket: &'a Bucket<K, V>) -> Option<&'a V> where
         K: Eq,
 {
-    /*for i in SlotIndexIter::new() {
-        if bucket.occupied(i) {
-            unsafe {
-                if key == bucket.key(i) {
-                    return Some(bucket.val(i))
-                }
-            }
-        }
-    }*/
     /*for slot in bucket.slots() {
         // For now, we know we are "simple" so we skip this part.
         // if (!is_simple && partial != ti->buckets_[i].partial(j)) {

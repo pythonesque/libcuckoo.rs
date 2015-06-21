@@ -174,7 +174,7 @@ fn main() {
                  ((total_per_entry - ops_per_entry.read) as f64 / (total_per_entry as f64) * 100.0).round());
     }
     let ref map = CuckooHashMap::<_, _, DefaultState<FnvHasher>>::with_capacity_and_hash_state(CAPACITY, Default::default());
-    let upsert = |j: Key, stats: &mut Stats<Key>| {
+    let upsert = |_j: Key, stats: &mut Stats<Key>| {
         let range = /*if SLICE_THREADS == CORES {
             Range::new(th, th + 1)
         } else {
@@ -199,7 +199,7 @@ fn main() {
         }
         stats.upsert = stats.upsert.wrapping_add(upserts);
         stats.read = stats.read.wrapping_add(reads);
-        println!("({}) upserts", j);//, upserts);
+        //println!("({}) upserts", j);//, upserts);
         //Stats { upsert: inserts.wrapping_add(updates), read: updates, .. Stats::new(0) }
         //println!("({}) {} upserts ({} inserts, {} updates, {} finds)", j, inserts.wrapping_add(updates), inserts, updates, updates);
     };
@@ -224,7 +224,7 @@ fn main() {
         }
         stats.delete = stats.delete.wrapping_add(deletes);
         stats.read = stats.read.wrapping_add(reads);
-        println!("({}) deletes", j);//, writes);
+        //println!("({}) deletes", j);//, writes);
     };
     let insert = |j: Key, stats: &mut Stats<Key>| {
         let mut inserts: Key = 0;
@@ -238,7 +238,7 @@ fn main() {
             inserts = inserts.wrapping_add(1);
         }
         stats.insert = stats.insert.wrapping_add(inserts);
-        println!("({}) writes", j);//, writes);
+        //println!("({}) writes", j);//, writes);
     };
     let update = |j: Key, stats: &mut Stats<Key>| {
         let mut updates: Key = 0;
@@ -252,7 +252,7 @@ fn main() {
             updates = updates.wrapping_add(1);
         }
         stats.update = stats.update.wrapping_add(updates);
-        println!("({}) updates", j);//, updates);
+        //println!("({}) updates", j);//, updates);
     };
     let find = |th: Key, stats: &mut Stats<Key>| {
         let range = if SLICE_THREADS == CORES {
@@ -275,7 +275,7 @@ fn main() {
             }
         }
         stats.read = stats.read.wrapping_add(reads);
-        println!("({}) reads", th,);// reads);
+        //println!("({}) reads", th,);// reads);
     };
 
     #[cfg(feature="nothreads")]
@@ -305,6 +305,8 @@ fn main() {
                 //let end = sys::precise_time_ns();
                 //println!("({}) {} ns", j, end - start);
             }));
+            //let duration = self::sys::Duration::from_millis(2);
+            //self::sys::os::sleep(duration);
         }
         t
     }

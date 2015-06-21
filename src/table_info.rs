@@ -555,6 +555,41 @@ impl<'a> Deref for BucketIndex<'a> {
     }
 }
 
+pub struct Lock<'a> {
+    i: BucketIndex<'a>,
+}
+
+impl<'a> Lock<'a> {
+    /// locks the given bucket index.
+    #[inline(always)]
+    pub fn new<K, V>(ti: &Snapshot<'a, K, V>, i: BucketIndex<'a>) -> Self {
+        unsafe {
+            ti.locks.get_unchecked(lock_ind(*i)).lock();
+            Lock { i: i }
+        }
+    }
+
+    /// unlocks the given bucket index.
+    #[inline(always)]
+    pub fn release<K, V>(self, ti: &Snapshot<'a, K, V>) {
+        unsafe {
+            ti.locks.get_unchecked(lock_ind(*self.i)).unlock();
+        }
+    }
+
+    pub fn bucket<K, V>(&self, ti: &Snapshot<'a, K, V>) -> &Bucket<K, V> {
+        unsafe {
+            &*ti.buckets.get_unchecked(*self.i).get()
+        }
+    }
+
+    pub fn bucket_mut<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
+        unsafe {
+            &mut *ti.buckets.get_unchecked(*self.i).get()
+        }
+    }
+}
+
 pub struct LockTwo<'a> {
     i1: BucketIndex<'a>,
     i2: BucketIndex<'a>,
@@ -619,22 +654,6 @@ impl<'a> LockTwo<'a> {
             &mut *ti.buckets.get_unchecked(*self.i2).get()
         }
     }
-}
-
-/// lock locks the given bucket index.
-#[inline(always)]
-pub fn lock<'a, K, V>(ti: &Snapshot<'a, K, V>, i: BucketIndex<'a>) {
-    unsafe {
-        ti.locks.get_unchecked(lock_ind(*i)).lock();
-    }
-}
-
-/// unlock unlocks the given bucket index.
-///
-/// Unsafe because it assumes that i is locked.
-#[inline(always)]
-pub unsafe fn unlock<'a, K, V>(ti: &Snapshot<'a, K, V>, i: BucketIndex<'a>) {
-    ti.locks.get_unchecked(lock_ind(*i)).unlock();
 }
 
 pub struct LockThree<'a> {
@@ -727,27 +746,86 @@ impl<'a> LockThree<'a> {
     }
 }
 
-/// AllUnlocker is an object which releases all the locks on the given table
-/// info when its destructor is called.
-pub struct AllUnlocker<'a, K, V> where
-        K: 'a,
-        V: 'a,
-{
-    ti: &'a TableInfo<K, V>,
+pub struct LockAll<'a> {
+    marker: InvariantLifetime<'a>,
 }
 
-impl<'a, K, V> AllUnlocker<'a, K, V> {
-    /// Unsafe because it assumes that all of ti's locks are taken.
-    pub unsafe fn new(ti: &'a TableInfo<K, V>) -> Self {
-        AllUnlocker { ti: ti }
+impl<'a> LockAll<'a> {
+    #[inline]
+    pub fn new<K, V>(ti: &Snapshot<'a, K, V>) -> Self {
+        for lock in &ti.locks[..] {
+            lock.lock();
+        }
+        LockAll { marker: InvariantLifetime::new() }
+    }
+
+    pub fn release<K, V>(self, ti: &Snapshot<'a, K, V>) {
+        for lock in &ti.locks[..] {
+            lock.unlock();
+        }
+    }
+
+    #[inline]
+    pub fn buckets<'b, K, V>(&'b mut self, ti: &'b Snapshot<'a, K, V>) -> BucketIter<'b, K, V> {
+        unsafe {
+            let buckets = &ti.buckets;
+            let p = buckets.as_ptr();
+            intrinsics::assume(!p.is_null());
+            if mem::size_of::<Bucket<K, V>>() == 0 {
+                BucketIter {ptr: p,
+                         end: (p as usize + buckets.len()) as *const UnsafeCell<Bucket<K, V>>,
+                         _marker: PhantomData}
+            } else {
+                BucketIter {ptr: p,
+                         end: p.offset(buckets.len() as isize),
+                         _marker: PhantomData}
+            }
+        }
     }
 }
 
-impl<'a, K, V> Drop for AllUnlocker<'a, K, V> {
-    fn drop(&mut self) {
-        for lock in &self.ti.locks[..] {
-            lock.unlock();
+pub struct BucketIter<'a, K: 'a, V: 'a> {
+    ptr: *const UnsafeCell<Bucket<K, V>>,
+    end: *const UnsafeCell<Bucket<K, V>>,
+    _marker: PhantomData<&'a mut Bucket<K, V>>
+}
+
+impl<'a, K, V> Iterator for BucketIter<'a, K, V> {
+    type Item = &'a mut Bucket<K, V>;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a mut Bucket<K, V>> {
+        // could be implemented with slices, but this avoids bounds checks
+        unsafe {
+            intrinsics::assume(!self.ptr.is_null());
+            intrinsics::assume(!self.end.is_null());
+            if self.ptr == self.end {
+                None
+            } else {
+                if mem::size_of::<Bucket<K, V>>() == 0 {
+                    // purposefully don't use 'ptr.offset' because for
+                    // vectors with 0-size elements this would return the
+                    // same pointer.
+                    self.ptr = mem::transmute(self.ptr as usize + 1);
+
+                    // Use a non-null pointer value
+                    Some(&mut *(1 as *mut _))
+                } else {
+                    let old = self.ptr;
+                    self.ptr = self.ptr.offset(1);
+
+                    Some(mem::transmute(old))
+                }
+            }
         }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let diff = (self.end as usize) - (self.ptr as usize);
+        let size = mem::size_of::<Bucket<K, V>>();
+        let exact = diff / (if size == 0 {1} else {size});
+        (exact, Some(exact))
     }
 }
 
