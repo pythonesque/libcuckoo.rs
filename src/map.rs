@@ -181,8 +181,10 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
+        //const partial_t partial = partial_key(hv);
+        let partial = ();
         self.snapshot_and_lock_two(&hazard_pointer, hv, move |snapshot, mut lock| {
-            let result = cuckoo_contains(key, hv, &snapshot, &mut lock);
+            let result = cuckoo_contains(key, &snapshot, &mut lock, partial);
             lock.release(&snapshot);
             result
         })
@@ -599,12 +601,14 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// certain concurrency issues, the details of which are explained in the
     /// function. If run_cuckoo returns ok (success), then the slot it freed up
     /// is still locked. Otherwise it is unlocked.
-    fn run_cuckoo<'a>(&self,
-                      ti: &Snapshot<'a, K, V>,
-                      lock: LockTwo<'a>)
-                      -> Result<(LockTwo<'a>, &mut Bucket<K, V>, SlotIndex),
-                                CuckooError> where
-            K: Copy,
+    fn run_cuckoo<'a, P>(&self,
+                         key: K, val: V,
+                         ti: &Snapshot<'a, K, V>,
+                         lock: LockTwo<'a>,
+                         partial: P,
+                         counterid: &CounterIndex<'a>) -> InsertResult<(), K, V> where
+            K: Copy + Eq,
+            P: Copy,
     {
         // We must unlock i1 and i2 here, so that cuckoopath_search and
         // cuckoopath_move can lock buckets as desired without deadlock.
@@ -626,9 +630,11 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         // insert to try again if the comparison fails.
         let (i1, i2) = lock.release(ti);
 
+        let mut lock;
+        let slot;
         loop {
             unsafe {
-                // Note that this mem::uninitialized() is perfectly safe, because CuckoRecord is
+                // Note that this mem::uninitialized() is perfectly safe, because CuckooRecord is
                 // `Copy` and therefore can't have a destructor.  Of course, we still have to be
                 // careful not to use any uninitialized elements.
                 let mut cuckoo_path: [CuckooRecord<K>; MAX_BFS_PATH_LEN as usize] =
@@ -636,32 +642,54 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                 //let (cuckoo_path, depth) = (mem::uninitialized::<[CuckooRecord<K>; MAX_BFS_PATH_LEN as usize]>(), -1);//cuckoopath_search(ti, /*&mut cuckoo_path,*/ i1, i2);
                 let depth = self.cuckoopath_search(ti, &mut cuckoo_path, i1, i2);
                 if depth < 0 {
-                    break;
+                    // assert(st == failure);
+                    //LIBCUCKOO_DBG("hash table is full (hashpower = %zu, hash_items = %zu,"
+                    //              "load factor = %.2f), need to increase hashpower\n",
+                    //              ti->hashpower_, cuckoo_size(ti), cuckoo_loadfactor(ti));
+                    return Err((TableFull, key, val));
                 }
 
-                if let Some(lock) = cuckoopath_move(ti, &cuckoo_path, depth as usize, i1, i2) {
-                    let insert_bucket = cuckoo_path.get_unchecked(0).bucket;
-                    let insert_slot = cuckoo_path.get_unchecked(0).slot;
+                if let Some(lock_) = cuckoopath_move(ti, &cuckoo_path, depth as usize, i1, i2) {
+                    lock = lock_;
+                    slot = cuckoo_path.get_unchecked(0).slot;
                     //debug_assert!(insert_bucket == i1 || insert_bucket == i2);
                     //debug_assert!(!ti.locks.get_unchecked(lock_ind(i1)).try_lock());
                     //debug_assert!(!ti.locks.get_unchecked(lock_ind(i2)).try_lock());
                     //debug_assert!(!ti.buckets.get_unchecked(insert_bucket).occupied(insert_slot));
-                    return if ti as *const _ as *mut _ == self.table_info.load(Ordering::SeqCst) {
-                        let bucket = &mut *ti.buckets.get_unchecked(*insert_bucket).get();
-                        Ok((lock, bucket, insert_slot))
-                    } else {
-                        // Unlock i1 and i2 and signal to cuckoo_insert to try again. Since
-                        // we set the hazard pointer to be ti, this check isn't susceptible
-                        // to an ABA issue, since a new pointer can't have the same address
-                        // as ti.
-                        lock.release(ti);
-                        Err(CuckooError::UnderExpansion)
-                    };
+                    break;
                 }
             }
         }
 
-        Err(CuckooError::TableFull)
+        if ti as *const _ as *mut _ == self.table_info.load(Ordering::SeqCst) {
+            /*debug_assert!(!ti.locks.get_unchecked(lock_ind(i1)).try_lock());
+            debug_assert!(!ti.locks.get_unchecked(lock_ind(i2)).try_lock());
+            debug_assert!(!ti.buckets.get_unchecked(insert_bucket).occupied(insert_slot));
+            debug_assert!(insert_bucket == index_hash(ti, hv) ||
+                          insert_bucket == alt_index(ti, hv, index_hash(ti, hv)));*/
+            // Since we unlocked the buckets, another insert
+            // could have inserted the same key into either i1 or i2, so we
+            // check for that before doing the insert.
+            if cuckoo_contains(&key, ti, &mut lock, partial) {
+                lock.release(ti);
+                Err((KeyDuplicated, key, val))
+            } else {
+                add_to_bucket(ti, &counterid, partial, key, val,
+                              lock.bucket1(ti), slot);
+                lock.release(ti);
+                Ok(())
+            }
+        } else {
+            // Unlock i1 and i2 and signal to cuckoo_insert to try again. Since
+            // we set the hazard pointer to be ti, this check isn't susceptible
+            // to an ABA issue, since a new pointer can't have the same address
+            // as ti.
+            lock.release(ti);
+            // The run_cuckoo operation operated on an old version of the table,
+            // so we have to try again. We signal to the calling insert method
+            // to try again by returning failure_under_expansion.
+            Err((UnderExpansion, key, val))
+        }
     }
 
     /// cuckoo_insert tries to insert the given key-value pair into an empty slot
@@ -673,7 +701,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// function.
     fn cuckoo_insert<'a>(&self,
                          key: K, val: V,
-                         hv: usize,
+                         _hv: usize,
                          snapshot_lock: (Snapshot<'a, K, V>, LockTwo<'a>))
                          -> InsertResult<(), K, V> where
             K: Copy + Eq,
@@ -708,39 +736,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             }
         }
         // we are unlucky, so let's perform cuckoo hashing
-        match self.run_cuckoo(snapshot, lock) {
-            Err(CuckooError::UnderExpansion) => {
-                // The run_cuckoo operation operated on an old version of the table,
-                // so we have to try again. We signal to the calling insert method
-                // to try again by returning failure_under_expansion.
-                Err((UnderExpansion, key, val))
-            },
-            Ok((mut lock, insert_bucket, insert_slot)) => {
-                /*debug_assert!(!ti.locks.get_unchecked(lock_ind(i1)).try_lock());
-                debug_assert!(!ti.locks.get_unchecked(lock_ind(i2)).try_lock());
-                debug_assert!(!ti.buckets.get_unchecked(insert_bucket).occupied(insert_slot));
-                debug_assert!(insert_bucket == index_hash(ti, hv) ||
-                              insert_bucket == alt_index(ti, hv, index_hash(ti, hv)));*/
-                // Since we unlocked the buckets during run_cuckoo, another insert
-                // could have inserted the same key into either i1 or i2, so we
-                // check for that before doing the insert.
-                if cuckoo_contains(&key, hv, snapshot, &mut lock) {
-                    lock.release(snapshot);
-                    return Err((KeyDuplicated, key, val));
-                }
-                add_to_bucket(snapshot, &counterid, partial, key, val,
-                              insert_bucket, insert_slot);
-                lock.release(snapshot);
-                Ok(())
-            },
-            Err(CuckooError::TableFull) => {
-                // assert(st == failure);
-                //LIBCUCKOO_DBG("hash table is full (hashpower = %zu, hash_items = %zu,"
-                //              "load factor = %.2f), need to increase hashpower\n",
-                //              ti->hashpower_, cuckoo_size(ti), cuckoo_loadfactor(ti));
-                Err((TableFull, key, val))
-            }
-        }
+        self.run_cuckoo(key, val, snapshot, lock, partial, &counterid)
     }
 
     /// We run cuckoo_insert in a loop until it succeeds in insert and upsert, so
@@ -1421,13 +1417,12 @@ fn cuckoo_find<'a, K, V>(key: &K, _hv: usize,
 /// cuckoo_contains searches the table for the given key, returning true if
 /// it's in the table and false otherwise. It expects the locks to be taken
 /// and released outside the function.
-fn cuckoo_contains<'a, K, V>(key: &K, _hv: usize,
-                             snapshot: &Snapshot<'a, K, V>,
-                             lock: &mut LockTwo<'a>) -> bool where
+fn cuckoo_contains<'a, K, V, P>(key: &K,
+                                snapshot: &Snapshot<'a, K, V>,
+                                lock: &mut LockTwo<'a>, partial: P) -> bool where
         K: Copy + Eq,
+        P: Copy,
 {
-    //const partial_t partial = partial_key(hv);
-    let partial = ();
     check_in_bucket(partial, key, lock.bucket1(snapshot))
         || check_in_bucket(partial, key, lock.bucket2(snapshot))
 }
