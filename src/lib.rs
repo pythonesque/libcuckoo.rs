@@ -1,6 +1,9 @@
 //#![no_start]
-#![feature(asm,associated_consts,box_syntax,lang_items,libc,start,std_misc,thread_local,no_std,core,unsafe_no_drop_flag,/*rustc_private,*/zero_one,step_trait,optin_builtin_traits,simd)]
+#![feature(asm,associated_consts,box_syntax,lang_items,libc,start,thread_local,no_std,core,unsafe_no_drop_flag,/*rustc_private,*/zero_one,step_trait,optin_builtin_traits,simd)]
 #![feature(const_fn)]
+#![feature(nonzero)]
+#![feature(core_intrinsics)]
+#![feature(hashmap_hasher)]
 #![cfg_attr(not(feature="nothreads"), feature(scoped))]
 #![cfg_attr(test, feature(test))]
 #![allow(dead_code)]
@@ -287,6 +290,7 @@ fn main() {
     }
 
     #[cfg(not(feature="nothreads"))]
+    #[allow(deprecated)]
     unsafe fn make_threads<'a, F, T>(f: &'a F, s: &'a mut [T ; NUM_THREADS as usize])
                                      -> [thread::JoinGuard<'a, ()>; NUM_THREADS as usize] where
             F: Fn(Key, &'a mut T) + Send + Sync + 'a,

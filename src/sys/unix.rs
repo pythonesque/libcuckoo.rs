@@ -86,7 +86,7 @@ pub fn precise_time_ns() -> u64 {
 }*/
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-fn precise_time_ns() -> u64 {
+pub fn precise_time_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe {
         imp::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);

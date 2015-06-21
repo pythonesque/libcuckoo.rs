@@ -873,6 +873,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             insert_into_table_(new_map, ti, i, end);
         }
         #[cfg(not(feature="nothreads"))]
+        #[allow(deprecated)]
         unsafe fn insert_into_table<'a, K, V, S>(new_map: &'a CuckooHashMap<K, V, S>,
                                                  ti: TI<'a, K, V>,
                                                  //old_ti: HazardPointerSet<'a, TableInfo<K, V>>,
