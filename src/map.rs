@@ -159,7 +159,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
     /// find searches through the table for `key`, and returns `Some(value)` if
     /// it finds the value, `None` otherwise.
     pub fn find(&self, key: &K) -> Option<V> where
-            V: Copy,
+            V: Clone,
     {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
@@ -217,9 +217,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
 
     /// update changes the value associated with `key` to `val`. If `key` is
     /// not there, it returns false, otherwise it returns true.
-    pub fn update(&self, key: &K, val: V) -> Result<V, V> where
-            V: Copy,
-    {
+    pub fn update(&self, key: &K, val: V) -> Result<V, V> {
         let hazard_pointer = check_hazard_pointer();
         let hv = hashed_key(&self.hash_state, key);
         self.snapshot_and_lock_two(&hazard_pointer, hv, move |snapshot, mut lock| {
@@ -1403,13 +1401,13 @@ fn cuckoo_find<'a, K, V>(key: &K, _hv: usize,
                          snapshot: &Snapshot<'a, K, V>,
                          lock: &mut LockTwo<'a>) -> Option<V> where
         K: Eq,
-        V: Copy,
+        V: Clone,
 {
     //const partial_t partial = partial_key(hv);
     let partial = ();
     try_read_from_bucket(partial, key, lock.bucket1(snapshot))
         .or_else( || try_read_from_bucket(partial, key, lock.bucket2(snapshot)) )
-        .map( |&v| v )
+        .map( |v| v.clone() )
 }
 
 /// cuckoo_contains searches the table for the given key, returning true if
