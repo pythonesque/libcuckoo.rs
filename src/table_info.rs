@@ -385,6 +385,7 @@ pub struct CounterIndex<'a> {
     marker: InvariantLifetime<'a>,
 }
 
+#[cfg(feature = "counter")]
 impl<'a> CounterIndex<'a> {
     pub fn num_inserts<'b, K, V>(&'b self, ti: &'b Snapshot<'a, K, V>) -> &CacheInt {
         unsafe {
