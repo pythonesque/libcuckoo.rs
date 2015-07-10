@@ -385,6 +385,20 @@ pub struct CounterIndex<'a> {
     marker: InvariantLifetime<'a>,
 }
 
+impl<'a> CounterIndex<'a> {
+    pub fn num_inserts<'b, K, V>(&'b self, ti: &'b Snapshot<'a, K, V>) -> &CacheInt {
+        unsafe {
+            ti.num_inserts.get_unchecked(self.index)
+        }
+    }
+
+    pub fn num_deletes<'b, K, V>(&'b self, ti: &'b Snapshot<'a, K, V>) -> &CacheInt {
+        unsafe {
+            ti.num_deletes.get_unchecked(self.index)
+        }
+    }
+}
+
 /// counterid stores the per-thread counter index of each thread.
 #[cfg(feature = "counter")]
 #[thread_local] static COUNTER_ID: Counter = Counter(Cell::new(None));
@@ -577,13 +591,13 @@ impl<'a> Lock<'a> {
         }
     }
 
-    pub fn bucket<K, V>(&self, ti: &Snapshot<'a, K, V>) -> &Bucket<K, V> {
+    pub fn bucket<'b, K, V>(&'b self, ti: &'b Snapshot<'a, K, V>) -> &Bucket<K, V> {
         unsafe {
             &*ti.buckets.get_unchecked(*self.i).get()
         }
     }
 
-    pub fn bucket_mut<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
+    pub fn bucket_mut<'b, K, V>(&'b mut self, ti: &'b Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
         unsafe {
             &mut *ti.buckets.get_unchecked(*self.i).get()
         }
@@ -631,25 +645,25 @@ impl<'a> LockTwo<'a> {
         }
     }
 
-    pub fn bucket1<K, V>(&self, ti: &Snapshot<'a, K, V>) -> &Bucket<K, V> {
+    pub fn bucket1<'b, K, V>(&'b self, ti: &'b Snapshot<'a, K, V>) -> &Bucket<K, V> {
         unsafe {
             &*ti.buckets.get_unchecked(*self.i1).get()
         }
     }
 
-    pub fn bucket2<K, V>(&self, ti: &Snapshot<'a, K, V>) -> &Bucket<K, V> {
+    pub fn bucket2<'b, K, V>(&'b self, ti: &'b Snapshot<'a, K, V>) -> &Bucket<K, V> {
         unsafe {
             &*ti.buckets.get_unchecked(*self.i2).get()
         }
     }
 
-    pub fn bucket1_mut<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
+    pub fn bucket1_mut<'b, K, V>(&'b mut self, ti: &'b Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
         unsafe {
             &mut *ti.buckets.get_unchecked(*self.i1).get()
         }
     }
 
-    pub fn bucket2_mut<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
+    pub fn bucket2_mut<'b, K, V>(&'b mut self, ti: &'b Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
         unsafe {
             &mut *ti.buckets.get_unchecked(*self.i2).get()
         }
@@ -721,25 +735,25 @@ impl<'a> LockThree<'a> {
         }
     }
 
-    pub fn bucket1<K, V>(&self, ti: &Snapshot<'a, K, V>) -> &Bucket<K, V> {
+    pub fn bucket1<'b, K, V>(&'b self, ti: &'b Snapshot<'a, K, V>) -> &Bucket<K, V> {
         unsafe {
             &*ti.buckets.get_unchecked(*self.i1).get()
         }
     }
 
-    pub fn bucket1_mut<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
+    pub fn bucket1_mut<'b, K, V>(&'b mut self, ti: &'b Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
         unsafe {
             &mut *ti.buckets.get_unchecked(*self.i1).get()
         }
     }
 
-    pub fn bucket3<K, V>(&self, ti: &Snapshot<'a, K, V>) -> &Bucket<K, V> {
+    pub fn bucket3<'b, K, V>(&'b self, ti: &'b Snapshot<'a, K, V>) -> &Bucket<K, V> {
         unsafe {
             &*ti.buckets.get_unchecked(*self.i3).get()
         }
     }
 
-    pub fn bucket3_mut<K, V>(&mut self, ti: &Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
+    pub fn bucket3_mut<'b, K, V>(&'b mut self, ti: &'b Snapshot<'a, K, V>) -> &mut Bucket<K, V> {
         unsafe {
             &mut *ti.buckets.get_unchecked(*self.i3).get()
         }

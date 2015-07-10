@@ -1287,7 +1287,7 @@ fn add_to_bucket<'a, K, V, P>(ti: &Snapshot<'a, K, V>,
     #[inline(always)]
     #[cfg(feature = "counter")]
     fn insert_counter<'a, K, V>(ti: &Snapshot<'a, K, V>, counterid: &CounterIndex<'a>) {
-        let num_inserts = unsafe { ti.num_inserts.get_unchecked(counterid.index) };
+        let num_inserts = counterid.num_inserts(ti);
         num_inserts.fetch_add_relaxed(1);
     }
     #[cfg(not(feature = "counter"))]
@@ -1343,7 +1343,7 @@ fn try_del_from_bucket<'a, K, V, P>(ti: &Snapshot<'a, K, V>,
         #[inline(always)]
         #[cfg(feature = "counter")]
         fn delete_counter<'a, K, V>(ti: &Snapshot<'a, K, V>, counterid: &CounterIndex<'a>) {
-            let num_deletes = unsafe { ti.num_deletes.get_unchecked(counterid.index) };
+            let num_deletes = counterid.num_deletes(ti);
             num_deletes.fetch_add_relaxed(1);
         }
         #[cfg(not(feature = "counter"))]
