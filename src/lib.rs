@@ -43,7 +43,7 @@ mod iter;
 mod hazard_pointer;
 mod map;
 mod mutex;
-mod nodemap;
+pub mod nodemap;
 mod simd;
 pub mod spinlock;
 mod sys;
