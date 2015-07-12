@@ -250,7 +250,7 @@ impl<K, V> Bucket<K, V> {
         unsafe {
             Bucket {
                 occupied: [false; SLOT_PER_BUCKET],
-                kv: Some(mem::uninitialized()),
+                kv: Some(mem::dropped()),
             }
         }
     }

@@ -128,7 +128,7 @@ impl SeedableRng<[u32; 4]> for XorShiftRng {
     #[inline]
     fn reseed(&mut self, seed: [u32; 4]) {
         if !seed.iter().all(|&x| x == 0) {
-            // "XorShiftRng.reseed called with an all zero seed."
+            //println!("XorShiftRng.reseed called with an all zero seed.");
             unsafe { intrinsics::abort(); }
         }
 
@@ -141,7 +141,7 @@ impl SeedableRng<[u32; 4]> for XorShiftRng {
     /// Create a new XorShiftRng. This will panic if `seed` is entirely 0.
     fn from_seed(seed: [u32; 4]) -> XorShiftRng {
         if !seed.iter().all(|&x| x == 0) {
-            //"XorShiftRng::from_seed called with an all zero seed."
+            //println!("XorShiftRng::from_seed called with an all zero seed.");
             unsafe { intrinsics::abort(); }
         }
 

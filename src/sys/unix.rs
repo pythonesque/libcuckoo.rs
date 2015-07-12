@@ -49,6 +49,7 @@ mod imp {
                 LOCK.lock();
                 if !ONCE.load(Ordering::Relaxed) {
                     mach_timebase_info(&mut INFO);
+                    //println!("Aborting: INFO denominator was zero.");
                     if INFO.denom == 0 { intrinsics::abort(); }
                     ONCE.store(true, Ordering::Relaxed);
                 }
@@ -147,6 +148,7 @@ pub fn sleep(dur: Duration) {
     // nanosleep will fill in `ts` with the remaining time.
     unsafe {
         while libc::nanosleep(&ts, &mut ts) == -1 {
+            //println!("Aborting: error fetching time.");
             if errno() == libc::EINTR { intrinsics::abort(); }
         }
     }

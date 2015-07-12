@@ -1,12 +1,16 @@
 [package]
-name = "libcukoo"
+name = "cuckoo"
 version = "0.1.0"
 authors = ["Joshua Yanovski <pythonesque@gmail.com>"]
 
 [dependencies]
-num_cpus = "0.2.5"
+num_cpus = "0.2.6"
 rand = "0.3"
 # mach = "0.0.2"
+
+[features]
+counter = []
+nothreads = []
 
 # [dependencies.clock_ticks]
 # version = "0.0.5"

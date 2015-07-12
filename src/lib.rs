@@ -3,6 +3,7 @@
 #![feature(const_fn)]
 #![feature(nonzero)]
 #![feature(core_intrinsics)]
+#![feature(filling_drop)]
 #![feature(hashmap_hasher)]
 #![cfg_attr(not(feature="nothreads"), feature(scoped))]
 #![cfg_attr(test, feature(test))]
@@ -375,5 +376,5 @@ fn main() {
     //0
 }
 
-/*pub struct CukooHashMap<K, V, S = RandomState> {
+/*pub struct CuckooHashMap<K, V, S = RandomState> {
 }*/

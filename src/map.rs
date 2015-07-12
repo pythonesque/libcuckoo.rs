@@ -600,6 +600,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                          counterid: &CounterIndex<'a>) -> InsertResult<(), K, V> where
             K: Copy + Eq,
             P: Copy,
+            CuckooRecord<'a, K>: Copy,
     {
         // We must unlock i1 and i2 here, so that cuckoopath_search and
         // cuckoopath_move can lock buckets as desired without deadlock.
@@ -1003,7 +1004,7 @@ impl<K, V> CuckooHashMap<K, V, DefaultState<SipHasher>> where
         /*K: fmt::Debug,*/
         /*V: fmt::Debug,*/
 {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Default::default()
     }
 }
@@ -1043,6 +1044,7 @@ static constexpr size_t const_pow(size_t a, size_t b) {
 const MAX_BFS_PATH_LEN: u8 = 5;
 
 /// CuckooRecord holds one position in a cuckoo path.
+#[derive(Clone, Copy)]
 struct CuckooRecord<'a, K> {
     bucket: BucketIndex<'a>,
     slot: SlotIndex,
