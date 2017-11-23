@@ -186,20 +186,6 @@ pub mod poison {
 /// destructors. As a result, a `StaticMutex` has one extra method when compared
 /// to a `Mutex`, a `destroy` method. This method is unsafe to call, and
 /// documentation can be found directly on the method.
-///
-/// # Examples
-///
-/// ```
-/// # #![feature(std_misc)]
-/// use std::sync::{StaticMutex, MUTEX_INIT};
-///
-/// static LOCK: StaticMutex = MUTEX_INIT;
-///
-/// {
-///     let _g = LOCK.lock().unwrap();
-///     // do some productive work
-/// }
-/// // lock is unlocked here.
 /// ```
 pub struct StaticMutex {
     lock: sys::Mutex,

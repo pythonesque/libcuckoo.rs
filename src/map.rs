@@ -1502,12 +1502,11 @@ mod tests {
     extern crate test;
 
     use num_cpus;
-    use std::collections::hash_state::{DefaultState, HashState};
-    use std::hash::{Hash, Hasher};
+    use core::hash::{BuildHasher, Hash, Hasher, BuildHasherDefault};
+    use crossbeam;
     use std::i32;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
     use super::{Depth, MAX_BFS_PATH_LEN, MAX_CUCKOO_COUNT};
     use super::CuckooHashMap;
     use super::super::iter::Range;
@@ -1559,11 +1558,11 @@ mod tests {
 
     #[bench]
     fn bench_hash(b: &mut test::Bencher) {
-        let hash_state = DefaultState::<FnvHasher>::default();
+        let hash_state = BuildHasherDefault::<FnvHasher>::default();
         const KEY: u32 = !0;
 
         b.iter( || {
-            let mut state = hash_state.hasher();
+            let mut state = hash_state.build_hasher();
             test::black_box(KEY).hash(&mut state);
             test::black_box(state.finish() as usize)
         } );
@@ -1576,8 +1575,8 @@ mod tests {
         use std::collections::HashMap;
         // 34ns is the time to beat (i.e. the time the cuckoo hash map seems to take in a real
         // benchmark, on average)
-        let state = DefaultState::<FnvHasher>::default();
-        let mut map = HashMap::with_capacity_and_hash_state(SIZE, state);
+        let state = BuildHasherDefault::<FnvHasher>::default();
+        let mut map = HashMap::with_capacity_and_hasher(SIZE, state);
         let num_cpus = num_cpus::get() as u32;
         b.iter( || {
             for i in Range::new(0, num_cpus * MAX) {
@@ -1591,31 +1590,32 @@ mod tests {
     fn bench_cuckoo_hashmap(b: &mut test::Bencher) {
         const MAX: u32 = 325_000;
         const SIZE: usize = 1 << 21;
-        let state = DefaultState::<FnvHasher>::default();
+        let state = BuildHasherDefault::<FnvHasher>::default();
         let ref map = CuckooHashMap::with_capacity_and_hash_state(SIZE, state);
         let num_cpus = num_cpus::get() as u32;
         let ref done = AtomicBool::new(false);
         let ref barrier = Barrier::new(num_cpus as usize + 1);
-        let mut threads = Vec::with_capacity(num_cpus as usize);
-        for i in Range::new(0, num_cpus) {
-            threads.push(thread::scoped( move || {
-                loop {
-                    barrier.wait();
-                    if done.load(Ordering::SeqCst) { break }
-                    for i in Range::new(i * MAX, i.checked_add(1).unwrap() * MAX) {
-                        let _ = map.upsert(i, |_| (), ());
+        crossbeam::scope(|scope| {
+            for i in Range::new(0, num_cpus) {
+                scope.spawn( move || {
+                    loop {
+                        barrier.wait();
+                        if done.load(Ordering::SeqCst) { break }
+                        for i in Range::new(i * MAX, i.checked_add(1).unwrap() * MAX) {
+                            let _ = map.upsert(i, |_| (), ());
+                        }
+                        barrier.wait();
                     }
-                    barrier.wait();
-                }
-            }));
-        }
-        b.iter( move || {
-            // Test start
-            barrier.wait();
-            // Test end
+                });
+            }
+            b.iter( move || {
+                // Test start
+                barrier.wait();
+                // Test end
+                barrier.wait();
+            });
+            done.store(true, Ordering::SeqCst);
             barrier.wait();
         });
-        done.store(true, Ordering::SeqCst);
-        barrier.wait();
     }
 }
