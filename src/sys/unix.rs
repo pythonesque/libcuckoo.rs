@@ -20,21 +20,21 @@ mod imp {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod imp {
-    use core::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, Ordering};
     use core::intrinsics;
-    use libc::{timeval, timezone, c_int, mach_timebase_info};
+    use libc::{timeval, timezone, c_int, mach_timebase_info as mach_timebase_info_};
     use super::super::super::spinlock::SpinLock;
 
     extern {
         pub fn gettimeofday(tp: *mut timeval, tzp: *mut timezone) -> c_int;
         pub fn mach_absolute_time() -> u64;
-        pub fn mach_timebase_info(info: *mut mach_timebase_info) -> c_int;
+        pub fn mach_timebase_info(info: *mut mach_timebase_info_) -> c_int;
     }
 
     /// After this is called, the return mach_timebase_info is guaranteed to have a nonzero
     /// denominator.
-    pub fn info() -> &'static mach_timebase_info {
-        static mut INFO: mach_timebase_info = mach_timebase_info {
+    pub fn info() -> &'static mach_timebase_info_ {
+        static mut INFO: mach_timebase_info_ = mach_timebase_info_ {
             numer: 0,
             denom: 0,
         };
@@ -74,7 +74,7 @@ pub fn precise_time_ns() -> u64 {
     unsafe {
         let time = imp::mach_absolute_time();
         let info = imp::info();
-        intrinsics::unchecked_udiv(time.wrapping_mul(info.numer as u64), info.denom as u64)
+        intrinsics::unchecked_div(time.wrapping_mul(info.numer as u64), info.denom as u64)
     }
 }
 

@@ -21,7 +21,7 @@ impl HazardPointer {
         // NOTE: This is definitely a huge bottleneck!  Seriously investigate relaxing
         // this to release.
         intrinsics::atomic_store_rel(self.0.get(), ti as usize);
-        HazardPointerSet { marker: PhantomData, ti: NonZero::new(ti) }
+        HazardPointerSet { marker: PhantomData, ti: NonZero::new_unchecked(ti) }
     }
 }
 
@@ -34,7 +34,7 @@ pub struct HazardPointerSet<'a, T: 'a> {
 
 impl<'a, T> HazardPointerSet<'a, T> {
     pub fn as_raw(&self) -> *mut T {
-        *self.ti
+        self.ti.get()
     }
 }
 
@@ -43,7 +43,7 @@ impl<'a, T> Deref for HazardPointerSet<'a, T> {
 
     fn deref(&self) -> &T {
         unsafe {
-            &**self.ti
+            &*self.ti.get()
         }
     }
 }
@@ -88,7 +88,7 @@ pub fn new_hazard_pointer() -> &'static HazardPointer {
         let list = &mut GLOBAL_HAZARD_POINTERS;
         let node = box GlobalHazardPointerNode {
             next: list.list.take(),
-            hp: HazardPointer(UnsafeCell { value: 0 }),
+            hp: HazardPointer(UnsafeCell::new(0)),
         };
         list.list = Some(mem::transmute(node));
         let fst = list.list.as_mut().unwrap_or_else( || intrinsics::unreachable() );

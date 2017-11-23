@@ -1,14 +1,13 @@
+use crossbeam::{self, Scope};
 use self::InsertError::*;
 use std::cell::UnsafeCell;
 //use std::collections::hash_map::RandomState;
-use std::collections::hash_state::{DefaultState, HashState};
+use std::collections::hash_map::{DefaultHasher};
 //use std::fmt;
-use std::hash::{Hash, Hasher, SipHasher};
+use core::hash::{BuildHasher, Hash, Hasher, BuildHasherDefault};
 use std::intrinsics;
 use std::mem;
 use std::ptr;
-#[cfg(not(feature="nothreads"))]
-use std::thread;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use super::iter::Range;
 use super::hazard_pointer::{check_hazard_pointer, delete_unused, HazardPointer, HazardPointerSet};
@@ -57,7 +56,7 @@ fn reserve_calc(n: usize) -> usize {
 /// In my current benchmarks, inserts with (num_cpus) threads all working at once, even when most
 /// of them already exist, are about 80% faster than the speed of normal HashMap inserts with
 /// FnvHashMap with identical workloads, initial capacities, algorithm implementations, etc.).
-pub struct CuckooHashMap<K, V, S = DefaultState<SipHasher>> {
+pub struct CuckooHashMap<K, V, S = BuildHasherDefault<DefaultHasher>> {
     table_info: AtomicPtr<TableInfo<K, V>>,
 
     /// old_table_infos holds pointers to old TableInfos that were replaced
@@ -73,7 +72,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         K: Eq + Hash,
         /*K: fmt::Debug,*/
         /*V: fmt::Debug,*/
-        S: HashState,
+        S: BuildHasher,
 {
     /// cuckoo_init initializes the hashtable, given an initial hashpower as the
     /// argument.
@@ -798,10 +797,6 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         struct TI<'a, K, V>(&'a TableInfo<K, V>) where K: 'a, V: 'a;
         unsafe impl<'a, K, V> Send for TI<'a, K, V> where K: Send, V: Send {}
         unsafe impl<'a, K, V> Sync for TI<'a, K, V> where K: Send + Sync, V: Send + Sync {}
-        #[cfg(feature="nothreads")]
-        type Res<'a> = ();
-        #[cfg(not(feature="nothreads"))]
-        type Res<'a> = thread::JoinGuard<'a, ()>;
         /// insert_into_table is a helper function used by cuckoo_expand_simple to
         /// fill up the new table.
         ///
@@ -813,7 +808,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                                                   end: usize) where
                 K: Copy + Eq + Hash + Send + Sync,
                 V: Send + Sync,
-                S: Clone + HashState + Send + Sync,
+                S: Clone + BuildHasher + Send + Sync,
         {
         //let ref insert_into_table = |new_map: &CuckooHashMap<K, V, S>,
         //                             TI(old_ti): TI<K, V>,
@@ -825,8 +820,7 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             //println!("Inserting {}..{}", i, e);
             let end = (*old_ti).buckets.as_ptr().offset(end as isize);
             while bucket != end {
-                let kv = (*(*bucket).get()).kv.as_mut()
-                    .unwrap_or_else( || intrinsics::unreachable());
+                let kv = &mut (*(*bucket).get()).kv;
                 let mut keys = kv.keys.as_mut_ptr();
                 let mut vals = kv.vals.as_mut_ptr();
                 for occupied in &mut (*(*bucket).get()).occupied {
@@ -851,11 +845,12 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
         ///
         /// Unsafe because it expects the old table to be locked and i and end to be in bounds.
         #[cfg(feature="nothreads")]
-        unsafe fn insert_into_table<'a, K, V, S>(new_map: &CuckooHashMap<K, V, S>,
+        unsafe fn insert_into_table<'a, K, V, S>(scope: &Scope<'a>,
+                                                 new_map: &CuckooHashMap<K, V, S>,
                                                  ti: TI<K, V>,
                                                  //old_ti: HazardPointerSet<'a, TableInfo<K, V>>,
                                                  i: usize,
-                                                 end: usize) -> Res<'a> where
+                                                 end: usize) where
                 K: Copy + Eq + Hash + Send + Sync,
                 V: Send + Sync,
                 S: Clone + HashState + Send + Sync,
@@ -865,17 +860,17 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
             insert_into_table_(new_map, ti, i, end);
         }
         #[cfg(not(feature="nothreads"))]
-        #[allow(deprecated)]
-        unsafe fn insert_into_table<'a, K, V, S>(new_map: &'a CuckooHashMap<K, V, S>,
+        unsafe fn insert_into_table<'a, K, V, S>(scope: &Scope<'a>,
+                                                 new_map: &'a CuckooHashMap<K, V, S>,
                                                  ti: TI<'a, K, V>,
                                                  //old_ti: HazardPointerSet<'a, TableInfo<K, V>>,
                                                  i: usize,
-                                                 end: usize) -> Res<'a> where
+                                                 end: usize) where
                 K: Copy + Eq + Hash + Send + Sync,
                 V: Send + Sync,
-                S: Clone + HashState + Send + Sync,
+                S: Clone + BuildHasher + Send + Sync,
         {
-            thread::scoped(move || insert_into_table_(new_map, ti, i, end) )
+            scope.spawn(move || insert_into_table_(new_map, ti, i, end) );
         }
 
         self.snapshot_and_lock_all(hazard_pointer, move |ti, lock| {
@@ -908,37 +903,30 @@ impl<K, V, S> CuckooHashMap<K, V, S> where
                     intrinsics::abort();
                 }
                 let buckets_per_thread =
-                    intrinsics::unchecked_udiv(table_info::hashsize(ti.hashpower), threadnum);
+                    intrinsics::unchecked_div(table_info::hashsize(ti.hashpower), threadnum);
 
-                if mem::size_of::<Res>() != 0 &&
+                /* if mem::size_of::<Res>() != 0 &&
                    threadnum.checked_mul(mem::size_of::<Res>()).is_none() {
                     //println!("Overflow calculating join guard vector length");
                     intrinsics::abort();
-                }
-                {
+                } */
+                crossbeam::scope(|scope| {
                     //println!("computing");
                     let hashsize = table_info::hashsize(ti.hashpower);
-                    let mut vec = Vec::with_capacity(threadnum);
-                    let mut ptr = vec.as_mut_ptr();
                     let mut i = 0;
                     while i < threadnum.wrapping_sub(1) {
                         let ti = TI(&ti);
                         let start = i.wrapping_mul(buckets_per_thread);
                         i = i.wrapping_add(1);
                         let end = i.wrapping_mul(buckets_per_thread);
-                        let t = insert_into_table(new_map, ti, start, end);
-                        ptr::write(ptr, t);
-                        vec.set_len(i);
-                        ptr = ptr.offset(1);
+                        insert_into_table(scope, new_map, ti, start, end);
                     }
                     {
                         let ti = TI(&ti);
                         let start = i.wrapping_mul(buckets_per_thread);
-                        let t = insert_into_table(new_map, ti, start, hashsize);
-                        ptr::write(ptr, t);
-                        vec.set_len(threadnum);
+                        insert_into_table(scope, new_map, ti, start, hashsize);
                     }
-                }
+                });
                 //println!("done computing");
                 // Sets this table_info to new_map's. It then sets new_map's
                 // table_info to nullptr, so that it doesn't get deleted when
@@ -992,14 +980,14 @@ impl<K, V, S> Default for CuckooHashMap<K, V, S> where
         K: Eq + Hash,
         /*K: fmt::Debug,*/
         /*V: fmt::Debug,*/
-        S: HashState + Default
+        S: BuildHasher + Default
 {
     fn default() -> Self {
         Self::with_capacity_and_hash_state(DEFAULT_SIZE, Default::default())
     }
 }
 
-impl<K, V> CuckooHashMap<K, V, DefaultState<SipHasher>> where
+impl<K, V> CuckooHashMap<K, V, BuildHasherDefault<DefaultHasher>> where
         K: Eq + Hash,
         /*K: fmt::Debug,*/
         /*V: fmt::Debug,*/
@@ -1013,9 +1001,9 @@ impl<K, V> CuckooHashMap<K, V, DefaultState<SipHasher>> where
 #[inline(always)]
 fn hashed_key<K: ?Sized, S>(hash_state: &S, key: &K) -> usize where
         K: Hash,
-        S: HashState,
+        S: BuildHasher,
 {
-    let mut state = hash_state.hasher();
+    let mut state = hash_state.build_hasher();
     key.hash(&mut state);
     state.finish() as usize
 }
@@ -1505,7 +1493,7 @@ fn cuckoo_size<K, V>(ti: &TableInfo<K, V>) -> isize {
 fn cuckoo_loadfactor<K, V>(ti: &TableInfo<K, V>) -> f64 {
     unsafe {
         // The safety here relies on table_info::hashsize() always being nonzero.
-        intrinsics::unchecked_sdiv(cuckoo_size(ti) as f64 / SLOT_PER_BUCKET as f64, table_info::hashsize(ti.hashpower) as f64)
+        intrinsics::unchecked_div(cuckoo_size(ti) as f64 / SLOT_PER_BUCKET as f64, table_info::hashsize(ti.hashpower) as f64)
     }
 }
 

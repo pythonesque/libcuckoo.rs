@@ -4,7 +4,7 @@ use std::cell::UnsafeCell;
 use std::cell::Cell;
 use std::intrinsics;
 use std::marker::PhantomData;
-use std::mem;
+use std::mem::{self, ManuallyDrop};
 use std::ops::Deref;
 use std::ptr;
 use super::hazard_pointer::HazardPointerSet;
@@ -18,7 +18,6 @@ pub const SLOT_PER_BUCKET: usize = 4;
 /// number of locks in the locks_ array
 pub const K_NUM_LOCKS: usize = 1 << 16;
 
-//#[unsafe_no_drop_flag]
 pub struct BucketInner<K, V> {
     pub keys: [K ; SLOT_PER_BUCKET],
 
@@ -189,9 +188,8 @@ impl<'a, K, V> Iterator for SlotIterMut<'a, K, V> {
 /// bitset, which indicates whether the slot at the given bit index is in
 /// the table or not. It uses aligned_storage arrays to store the keys and
 /// values to allow constructing and destroying key-value pairs in place.
-//#[unsafe_no_drop_flag]
 pub struct Bucket<K, V> {
-    pub kv: Option<BucketInner<K, V>>,
+    pub kv: ManuallyDrop<BucketInner<K, V>>,
 
     pub occupied: [bool; SLOT_PER_BUCKET],
 }
@@ -207,32 +205,32 @@ impl<K, V> Bucket<K, V> {
     /// Unsafe because it does not ensure the location was already occupied.
     #[inline(always)]
     pub unsafe fn key(&self, SlotIndex(ind): SlotIndex) -> &K {
-        self.kv.as_ref().unwrap_or_else( || intrinsics::unreachable()).keys.get_unchecked(ind)
+        self.kv.keys.get_unchecked(ind)
     }
 
     /// Unsafe because it does not ensure the location was already occupied.
     #[inline(always)]
     unsafe fn key_mut(&mut self, SlotIndex(ind): SlotIndex) -> &mut K {
-        self.kv.as_mut().unwrap_or_else( || intrinsics::unreachable()).keys.get_unchecked_mut(ind)
+        self.kv.keys.get_unchecked_mut(ind)
     }
 
     /// Unsafe because it does not ensure the location was already occupied.
     #[inline(always)]
     pub unsafe fn val(&self, SlotIndex(ind): SlotIndex) -> &V {
-        self.kv.as_ref().unwrap_or_else( || intrinsics::unreachable()).vals.get_unchecked(ind)
+        self.kv.vals.get_unchecked(ind)
     }
 
     /// Unsafe because it does not ensure the location was already occupied.
     #[inline(always)]
     pub unsafe fn val_mut(&mut self, SlotIndex(ind): SlotIndex) -> &mut V {
-        self.kv.as_mut().unwrap_or_else( || intrinsics::unreachable()).vals.get_unchecked_mut(ind)
+        self.kv.vals.get_unchecked_mut(ind)
     }
 
     /// Does not check to make sure location was not already occupied; can leak.
     pub fn set_kv(&mut self, SlotIndex(ind): SlotIndex, k: K, v: V) {
         unsafe {
             *self.occupied.get_unchecked_mut(ind) = true;
-            let kv = self.kv.as_mut().unwrap_or_else( || intrinsics::unreachable());
+            let kv = &mut self.kv;
             ptr::write(kv.keys.as_mut_ptr().offset(ind as isize), k);
             ptr::write(kv.vals.as_mut_ptr().offset(ind as isize), v);
         }
@@ -241,7 +239,7 @@ impl<K, V> Bucket<K, V> {
     /// Unsafe because it does not ensure the location was already occupied.
     pub unsafe fn erase_kv(&mut self, SlotIndex(ind): SlotIndex) -> (K, V) {
         *self.occupied.get_unchecked_mut(ind) = false;
-        let kv = self.kv.as_mut().unwrap_or_else( || intrinsics::unreachable());
+        let kv = &mut self.kv;
         (ptr::read(kv.keys.as_mut_ptr().offset(ind as isize)),
          ptr::read(kv.vals.as_mut_ptr().offset(ind as isize)))
     }
@@ -250,22 +248,22 @@ impl<K, V> Bucket<K, V> {
         unsafe {
             Bucket {
                 occupied: [false; SLOT_PER_BUCKET],
-                kv: Some(mem::dropped()),
+                kv: ManuallyDrop::new(mem::uninitialized()),
             }
         }
     }
 
     pub fn clear(&mut self) {
-        let kv = match self.kv {
-            Some(ref mut kv) => kv,
-            None => return
-        };
+        let kv = &mut self.kv;
         let mut keys = kv.keys.as_mut_ptr();
         let mut vals = kv.vals.as_mut_ptr();
-        // We explicitly free occupied elements, but don't set kv to `None` to prevent double free.
+        // We explicitly free occupied elements, instead of calling drop on the ManuallyDrop
+        // Bucket.
         unsafe {
             for occupied in &mut self.occupied {
                 if *occupied {
+                    // Set *occupied to false first, so even if the drop panics nothing untoward
+                    // happens.
                     *occupied = false;
                     ptr::read(keys);
                     ptr::read(vals);
@@ -325,11 +323,8 @@ impl<K, V> Bucket<K, V> {
 
 impl<K, V> Drop for Bucket<K, V> {
     fn drop(&mut self) {
-        // We explicitly free occupied elements and then set kv to `None` to prevent double free.
+        // We explicitly free occupied elements, and never drop kv explicitly.
         self.clear();
-        unsafe {
-            ptr::write(&mut self.kv, None);
-        }
     }
 }
 
@@ -493,15 +488,15 @@ impl<K, V> TableInfo<K, V> {
         }
 
         unsafe {
-            let ti = box UnsafeCell {
-                value: TableInfo {
+            let ti = box UnsafeCell::new(
+                TableInfo {
                     hashpower: hashpower,
                     buckets: from_fn(hashsize(hashpower), || UnsafeCell::new(Bucket::new())),
                     locks: mem::uninitialized(),
                     num_inserts: from_fn(num_cpus, || CacheInt::new()),
                     num_deletes: from_fn(num_cpus, || CacheInt::new()),
                 }
-            };
+            );
             for lock in &mut (&mut *ti.get()).locks[..] {
                 ptr::write(lock, SpinLock::new());
             }
@@ -510,7 +505,6 @@ impl<K, V> TableInfo<K, V> {
     }
 }
 
-#[allow(raw_pointer_derive)]
 #[derive(Clone,Copy)]
 struct InvariantLifetime<'id>(
     PhantomData<*mut &'id ()>);

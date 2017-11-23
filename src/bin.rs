@@ -53,7 +53,7 @@ pub mod spinlock;
 mod sys;
 mod table_info;
 
-/*#[cfg(test)]
+#[cfg(test)]
 mod tests {
     extern crate test;
 
@@ -85,7 +85,7 @@ mod tests {
         b.iter( || sys::cpuid() );
         //println!("{}", unsafe { sys::cpuid() });
     }*/
-}*/
+}
 
 /*#[start]
 fn start(_argc: isize, _argv: *const *const u8) -> isize {
@@ -93,7 +93,7 @@ fn start(_argc: isize, _argv: *const *const u8) -> isize {
     0
 }*/
 
-/*#[cfg(not(test))]
+#[cfg(not(test))]
 fn main() {
     use core::intrinsics;
     use core::mem;
@@ -376,4 +376,4 @@ fn main() {
 }
 
 /*pub struct CuckooHashMap<K, V, S = RandomState> {
-}*/*/
+}*/

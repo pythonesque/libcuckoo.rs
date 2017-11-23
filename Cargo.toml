@@ -5,12 +5,17 @@ authors = ["Joshua Yanovski <pythonesque@gmail.com>"]
 
 [dependencies]
 num_cpus = "0.2.6"
-rand = "0.3"
+rand = "0.3.18"
 # mach = "0.0.2"
+crossbeam = "0.3.0"
 
 [features]
 counter = []
 nothreads = []
+
+[[bin]]
+name = "bin"
+path = "src/bin.rs"
 
 # [dependencies.clock_ticks]
 # version = "0.0.5"

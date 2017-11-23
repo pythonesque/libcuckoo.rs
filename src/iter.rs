@@ -1,6 +1,5 @@
 use core::mem;
 use core::iter::Step;
-use core::num::One;
 use core::ops::Add;
 
 pub struct Range<A> {
@@ -14,7 +13,7 @@ impl<A> Range<A> {
     }
 }
 
-impl<A: Step + One> Iterator for Range<A> where
+impl<A: Step> Iterator for Range<A> where
     for<'a> &'a A: Add<&'a A, Output = A>
 {
     type Item = A;
@@ -29,7 +28,7 @@ impl<A: Step + One> Iterator for Range<A> where
         // mishandles the version that places the mutation inside the
         // `if`: it seems to optimise the `Option<i32>` in a way that
         // confuses it.
-        let mut n = &self.start + &A::one();
+        let mut n = self.start.add_one();
         mem::swap(&mut n, &mut self.start);
         if n < self.end {
             Some(n)
@@ -40,7 +39,7 @@ impl<A: Step + One> Iterator for Range<A> where
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match Step::steps_between(&self.start, &self.end, &A::one()) {
+        match Step::steps_between(&self.start, &self.end.add_one()) {
             Some(hint) => (hint, Some(hint)),
             None => (0, None)
         }
