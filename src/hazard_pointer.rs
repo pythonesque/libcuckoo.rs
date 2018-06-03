@@ -1,9 +1,9 @@
-use core::nonzero::NonZero;
 use std::cell::{Cell, UnsafeCell};
 use std::intrinsics;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
+use std::ptr::NonNull;
 use super::mutex::{MUTEX_INIT, StaticMutex};
 
 //#[derive(Clone,Copy)]
@@ -21,20 +21,20 @@ impl HazardPointer {
         // NOTE: This is definitely a huge bottleneck!  Seriously investigate relaxing
         // this to release.
         intrinsics::atomic_store_rel(self.0.get(), ti as usize);
-        HazardPointerSet { marker: PhantomData, ti: NonZero::new_unchecked(ti) }
+        HazardPointerSet { marker: PhantomData, ti: NonNull::new_unchecked(ti) }
     }
 }
 
 //#[allow(raw_pointer_derive)]
 //#[derive(Clone,Copy)]
 pub struct HazardPointerSet<'a, T: 'a> {
-    ti: NonZero<*mut T>,
+    ti: NonNull<T>,
     marker: PhantomData<(&'a HazardPointer, &'a T)>,
 }
 
 impl<'a, T> HazardPointerSet<'a, T> {
     pub fn as_raw(&self) -> *mut T {
-        self.ti.get()
+        self.ti.as_ptr()
     }
 }
 
@@ -43,7 +43,7 @@ impl<'a, T> Deref for HazardPointerSet<'a, T> {
 
     fn deref(&self) -> &T {
         unsafe {
-            &*self.ti.get()
+            self.ti.as_ref()
         }
     }
 }

@@ -1,5 +1,5 @@
 //#![no_start]
-#![feature(asm,box_syntax,lang_items,libc,start,thread_local,core,/*rustc_private,*/zero_one,step_trait,optin_builtin_traits,simd)]
+#![feature(asm,box_syntax,lang_items,libc,start,stdsimd,thread_local,core,/*rustc_private,*/zero_one,step_trait,optin_builtin_traits)]
 #![feature(const_fn)]
 #![feature(nonzero)]
 #![feature(core_intrinsics)]
@@ -48,7 +48,6 @@ mod hazard_pointer;
 mod map;
 mod mutex;
 pub mod nodemap;
-mod simd;
 pub mod spinlock;
 mod sys;
 mod table_info;

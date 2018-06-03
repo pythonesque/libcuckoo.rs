@@ -328,7 +328,7 @@ impl<K, V> Drop for Bucket<K, V> {
     }
 }
 
-type CacheAlign = super::simd::u64x8;
+type CacheAlign = ::std::simd::u64x8;
 //struct CacheAlign;
 
 /// cacheint is a cache-aligned atomic integer type
@@ -467,7 +467,7 @@ impl<K, V> TableInfo<K, V> {
                 //println!("capacity error: new TableInfo");
                 unsafe { intrinsics::abort(); }
             }
-            let mut vec = Vec::with_capacity(n);
+            let mut vec = Vec::<T>::with_capacity(n);
             unsafe {
                 let mut ptr = vec.as_mut_ptr();
                 let end = ptr.offset(n as isize);

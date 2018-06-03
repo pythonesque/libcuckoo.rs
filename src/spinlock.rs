@@ -9,7 +9,7 @@ use super::sys::os::sleep;
 const MIN_DELAY_MSEC: u32 = 1;
 const MAX_DELAY_MSEC: u32 = 1000;
 
-//type SpinLockAlign = super::simd::u64x8;
+//type SpinLockAlign = std::simd::u64x8;
 struct SpinLockAlign;
 
 #[cfg(test)]
