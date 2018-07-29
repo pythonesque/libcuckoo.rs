@@ -1,5 +1,6 @@
 //#![no_start]
 #![feature(asm,box_syntax,lang_items,libc,start,stdsimd,thread_local,core,/*rustc_private,*/zero_one,step_trait,optin_builtin_traits)]
+#![feature(repr_simd)]
 #![feature(const_fn)]
 #![feature(nonzero)]
 #![feature(core_intrinsics)]

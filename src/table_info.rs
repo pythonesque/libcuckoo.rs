@@ -328,8 +328,10 @@ impl<K, V> Drop for Bucket<K, V> {
     }
 }
 
-type CacheAlign = ::std::simd::u64x8;
-//struct CacheAlign;
+// type CacheAlign = ::std::simd::u64x8;
+#[repr(simd)]
+struct CacheAlign(u64, u64, u64, u64,
+                  u64, u64, u64, u64);
 
 /// cacheint is a cache-aligned atomic integer type
 #[repr(C)]
